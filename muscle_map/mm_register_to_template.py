@@ -28,16 +28,17 @@ if sct_version != '6.5':
      print('WARNING: Spinal Cord Toolbox Version 6.5 not installed.')
      print(f"WARNING: Spinal Cord Toolbox Version {sct_version} installed.")
 
-try:
-    # Attempt to import as if it is a part of a package
-    from .mm_util import check_image_exists, get_template_paths, validate_register_to_template_args, create_output_dir
-except ImportError:
-    # Fallback to direct import if run as a standalone script
-    from mm_util import check_image_exists, get_template_paths, validate_register_to_template_args, create_output_dir
+from muscle_map.mm_util import (
+    check_image_exists,
+    create_output_dir,
+    get_template_paths,
+    validate_register_to_template_args,
+)
 
 #naming not functional
 # get_parser: parses command line arguments, sets up a) required (image, body region), and b) optional arguments (model, output file name, output directory)
-def get_parser():
+def get_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for template registration."""
     parser = argparse.ArgumentParser(
         description="Register an image and segmentations to the specified template.")
     
@@ -64,6 +65,7 @@ def get_parser():
     return parser
 
 def extract_centerline_points(im):
+                    """Extract centerline points from a segmentation image."""
                     data_labels = im.data.astype(np.int8)
                     nb_slices = data_labels.shape[2]
                     centers = []

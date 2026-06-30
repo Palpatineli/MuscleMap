@@ -1,9 +1,9 @@
 .DS_Store
 __pycache__/
 **/__pycache__/
-scripts.egg-info/
+*.egg-info/
 
-scripts/models/*/
+models/*/
 
 *.pth
 *.nii.gz

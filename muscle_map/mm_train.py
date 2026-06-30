@@ -27,13 +27,12 @@ from monai.transforms.spatial.dictionary import Orientationd, RandRotated, Spaci
 from monai.transforms.utility.dictionary import EnsureChannelFirstd, EnsureTyped
 from monai.utils import set_determinism
 
-try:
-    from .mm_util import load_model_config
-except ImportError:
-    from mm_util import load_model_config
+from muscle_map.mm_util import load_model_config
 
 
 class RemapLabelValuesd(MapTransform):
+    """Map original segmentation label values to compact training class IDs."""
+
     def __init__(self, keys, id_map, allow_missing_keys=False):
         super().__init__(keys, allow_missing_keys)
         self.id_map = {int(k): int(v) for k, v in id_map.items()}
@@ -50,6 +49,8 @@ class RemapLabelValuesd(MapTransform):
 
 
 class SqueezeLastSpatialDimd(MapTransform):
+    """Convert single-slice 3D patches into 2D patches for 2D models."""
+
     def __init__(self, keys, allow_missing_keys=False):
         super().__init__(keys, allow_missing_keys)
 
@@ -62,7 +63,8 @@ class SqueezeLastSpatialDimd(MapTransform):
         return d
 
 
-def get_parser():
+def get_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for dataset stats and model training."""
     parser = argparse.ArgumentParser(
         description="Train a MuscleMap-compatible MONAI UNet checkpoint from NIfTI image/label pairs."
     )

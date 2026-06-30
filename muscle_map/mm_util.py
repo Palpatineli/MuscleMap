@@ -1121,10 +1121,7 @@ def calculate_metrics_thresholding(
     # --- QC: one window per anatomy group (left + right combined) ---
     erased_masks: Dict[int, np.ndarray] = {}   # {lbl: 3D bool mask}
     if qc:
-        try:
-            from .mm_qc_gui import QCManager
-        except ImportError:
-            from mm_qc_gui import QCManager
+        from muscle_map.mm_qc_gui import QCManager
         _qc_manager = QCManager()
         anatomy_groups = _build_anatomy_groups(model_config, results_entry, cluster_data)
         for anatomy_name, group_lbls in anatomy_groups.items():

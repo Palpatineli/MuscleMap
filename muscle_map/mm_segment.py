@@ -17,18 +17,24 @@ from monai.transforms.intensity.dictionary import NormalizeIntensityd
 from monai.transforms.croppad.dictionary import CropForegroundd, SpatialPadd
 from monai.networks.layers.factories import Norm
 from time import perf_counter
-try:
-    # Attempt to import as if it is a part of a package
-    from .mm_util import check_image_exists, get_model_and_config_paths, load_model_config, validate_seg_arguments, RemapLabels,SqueezeTransform, run_inference,is_nifti
-except ImportError:
-    # Fallback to direct import if run as a standalone script
-    from mm_util import check_image_exists, get_model_and_config_paths, load_model_config, validate_seg_arguments,RemapLabels,SqueezeTransform, run_inference,is_nifti
 import torch
+
+from muscle_map.mm_util import (
+    RemapLabels,
+    SqueezeTransform,
+    check_image_exists,
+    get_model_and_config_paths,
+    is_nifti,
+    load_model_config,
+    run_inference,
+    validate_seg_arguments,
+)
 
 warnings.filterwarnings("ignore")
 print("Command line arguments received:", sys.argv)
 
-def chunk_size_arg(value):
+def chunk_size_arg(value: str) -> int | str:
+    """Parse a positive chunk size or the special value 'auto'."""
     if isinstance(value, str) and value.lower() == "auto":
         return "auto"
     try:
@@ -41,7 +47,8 @@ def chunk_size_arg(value):
 
 #naming not functional
 # get_parser: parses command line arguments, sets up a) required (image, body region), and b) optional arguments (model, output file name, output directory)
-def get_parser():
+def get_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for segmentation inference."""
     parser = argparse.ArgumentParser(
             description="Segment an input image according to the specified region.")
 
@@ -76,7 +83,8 @@ def get_parser():
     return parser
 
 # main: sets up logging, parses command-line arguments using parser, runs model, inference, post-processing
-def main():
+def main() -> None:
+    """Run MuscleMap segmentation inference."""
     gc.collect()
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -263,4 +271,3 @@ def main():
     logging.info("Inference completed. All outputs saved.")
 if __name__ == "__main__":
     main()
-

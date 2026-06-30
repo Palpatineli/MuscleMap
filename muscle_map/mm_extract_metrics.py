@@ -7,19 +7,23 @@ import argparse
 import numpy as np
 import logging
 import math
-try:
-    # Attempt to import as if it is a part of a package
-    from .mm_util import (get_config_path, load_model_config, validate_extract_args,
-    extract_image_data, create_output_dir,  calculate_metrics_dixon,
-    calculate_metrics_average,calculate_metrics_thresholding,build_entry_dict_metrics,results_entry_to_dataframe,
-    add_slice_counts)
-except ImportError:
-    from mm_util import (get_config_path, load_model_config, validate_extract_args,
-                         extract_image_data, create_output_dir,
-                         calculate_metrics_dixon, calculate_metrics_average,
-                         calculate_metrics_thresholding, build_entry_dict_metrics, results_entry_to_dataframe,
-                         add_slice_counts)
-def get_parser():
+
+from muscle_map.mm_util import (
+    add_slice_counts,
+    build_entry_dict_metrics,
+    calculate_metrics_average,
+    calculate_metrics_dixon,
+    calculate_metrics_thresholding,
+    create_output_dir,
+    extract_image_data,
+    get_config_path,
+    load_model_config,
+    results_entry_to_dataframe,
+    validate_extract_args,
+)
+
+def get_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for muscle metrics extraction."""
     parser = argparse.ArgumentParser(description="Extract metrics of muscle size and composition")
 
     parser.add_argument("-m", '--method', required=True, type=str, choices=['dixon', 'kmeans', 'gmm', 'average'], 
@@ -54,7 +58,8 @@ def get_parser():
 
     return parser
 
-def main():
+def main() -> None:
+    """Extract quantitative metrics from a segmentation mask."""
     logging.basicConfig(level=logging.INFO)
     logging.getLogger().addFilter(lambda r: r.levelno != logging.WARNING)
     logging.info("-" * 60)
