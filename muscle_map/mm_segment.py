@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+from ntpath import exists
+from pathlib import Path
 import warnings
 import argparse
 import logging
@@ -12,6 +14,7 @@ from monai.transforms.post.dictionary import AsDiscreted, Invertd
 from monai.transforms.spatial.dictionary import Orientationd, Spacingd
 from monai.transforms.compose import Compose
 from monai.transforms.io.dictionary import LoadImaged
+from monai.transforms.transform import MapTransform
 from monai.transforms.utility.dictionary import EnsureTyped, EnsureChannelFirstd
 from monai.transforms.intensity.dictionary import NormalizeIntensityd
 from monai.transforms.croppad.dictionary import CropForegroundd, SpatialPadd
@@ -20,14 +23,13 @@ from time import perf_counter
 import torch
 
 from muscle_map.mm_util import (
+    ModelConfig,
     RemapLabels,
     SqueezeTransform,
     check_image_exists,
     get_model_and_config_paths,
     is_nifti,
-    load_model_config,
     run_inference,
-    validate_seg_arguments,
 )
 
 warnings.filterwarnings("ignore")
@@ -35,7 +37,7 @@ print("Command line arguments received:", sys.argv)
 
 def chunk_size_arg(value: str) -> int | str:
     """Parse a positive chunk size or the special value 'auto'."""
-    if isinstance(value, str) and value.lower() == "auto":
+    if value.lower() == "auto":
         return "auto"
     try:
         parsed = int(value)
@@ -71,9 +73,6 @@ def get_parser() -> argparse.ArgumentParser:
     optional.add_argument("--model_version", default="latest", required=False, type=str,
                           help="Model version to use, e.g. '1.3'. Default: latest available on Zenodo.")
 
-    optional.add_argument("-g", '--use_GPU', required=False, default = 'Y', type=str ,choices=['Y', 'N'],
-                          help="If N will use the cpu even if a cuda enabled device is identified. Default is Y.")
-
     optional.add_argument("-s", '--overlap', required=False, default = 90, type=float,
                           help="Percent spatial overlap during sliding window inference, higher percent may improve accuracy but will reduce inference speed. Default is 90. If inference speed needs to be increased, the spatial overlap can be lowered. For large high-resolution or whole-body images, we recommend lowering the spatial inference to 50.")
 
@@ -94,32 +93,20 @@ def main() -> None:
     parser = get_parser()
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.use_GPU=='Y' else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     logging.info(f"Processing using cuda or cpu: {device}")
 
-    amp_context = torch.amp.autocast('cuda') if torch.cuda.is_available() and args.use_GPU == 'Y' else nullcontext()
+    amp_context = torch.amp.autocast('cuda') if torch.cuda.is_available() else nullcontext()
 
     if device.type =='cuda':
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.benchmark = True
     else:
-        logging.info(f"Processing on a CPU will slow down inference speed")
+        logging.info("Processing on a CPU will slow down inference speed")
 
-    if args.output_dir is None:
-        output_dir = os.getcwd()
-
-    elif not os.path.exists(args.output_dir):
-        output_dir = os.path.abspath(args.output_dir) 
-        os.makedirs(output_dir)
-
-    elif os.path.exists(args.output_dir):
-        output_dir=args.output_dir
-    else:
-        logging.error(f"Error: {args.output_dir}. Output must be path to output directory.")
-        sys.exit(1)
-
-    validate_seg_arguments(args)
+    if (output := Path.cwd() if (output := args.output_dir) is None else Path(output).absolute()):
+        output.parent.mkdir(exist_ok=True)
 
     image_paths = [image.strip() for image in args.input_image.split(',')]
     for image_path in image_paths:
@@ -133,47 +120,30 @@ def main() -> None:
 
     model_path, model_config_path = get_model_and_config_paths(args.region, args.model, args.model_version)
 
-    model_config = load_model_config(model_config_path)
-    model_version = model_config.get("model", {}).get("version", "unknown")
+    model_config = ModelConfig.load_config(Path(model_config_path))
+    model_version = model_config.architecture.version
     logging.info(f"Task: Segmentation  |  Region: {args.region.capitalize()}  |  Model version: {model_version}")
 
     norm_map = {
-            "instance": Norm.INSTANCE,
+            "instance": Norm.INSTANCE,  # pyright: ignore[reportUnknownMemberType]
             }
-    try:
-        roi_size = tuple(model_config['parameters']['roi_size'])
-        spatial_window_batch_size = model_config['parameters']['spatial_window_batch_size']
-        pix_dim = tuple(model_config['parameters']['pix_dim'])
-        spatial_dims = model_config['model']['spatial_dims']
-        in_channels = model_config['model']['in_channels']
-        out_channels = model_config['model']['out_channels']
-        channels = model_config['model']['channels']
-        act = model_config['model']['act']
-        strides = model_config['model']['strides']
-        num_res_units = model_config['model']['num_res_units']
-        import_norm_str = model_config['model']['norm']
-        label_entries = model_config["labels"]
-    except KeyError as e:
-        logging.error(f"Missing key in model configuration file: {e}")
-        sys.exit(1)
+    # TODO: find a place for data fingerprint, and to calculate pix_dim, should use _resolve_pix_dim
+    pix_dim = tuple(model_config['parameters']['pix_dim'])
+    spatial_dims = model_config.architecture.spatial_dims
+    out_channels = len(model_config.dataset.labels) - 1
 
-    labels = sorted({entry["value"] for entry in label_entries})
+    labels = sorted(list(model_config.dataset.labels.values()))
     id_map = {0: 0}
     for new_id, orig in enumerate(labels, start=1):
         id_map[orig] = new_id
     inv_id_map = {new_id: orig for orig, new_id in id_map.items()}
 
-    # Directory setup
-    if import_norm_str in norm_map:
-        import_norm = norm_map[import_norm_str]
-    else:
-        logging.error(f"Unknown normalization type: {import_norm_str}")
-        sys.exit(1) 
+    import_norm = norm_map[model_config.architecture.norm]
 
     if spatial_dims == 2:
-        pad_size = (roi_size[0], roi_size[1], 1)
+        pad_size = (*model_config.image.roi_size[0: 2], 1)
     elif spatial_dims == 3:
-        pad_size = roi_size
+        pad_size = model_config.image.roi_size
     else:
         logging.error(f"Unsupported spatial_dims: {spatial_dims}")
         sys.exit(1)
@@ -182,7 +152,7 @@ def main() -> None:
         LoadImaged(keys=["image"], image_only=False),
         EnsureChannelFirstd(keys=["image"]),
         Orientationd(keys=["image"], axcodes="RAS"),
-        Spacingd(keys=["image"], pixdim=pix_dim, mode="bilinear"),
+        Spacingd(keys=["image"], pixdim=model_config.dataset.pix_dim, mode="bilinear"),
         NormalizeIntensityd(keys=["image"], nonzero=True),
         CropForegroundd(keys=["image"], source_key="image", margin=20),
         SpatialPadd(
@@ -194,7 +164,7 @@ def main() -> None:
         ])
 
     post_transform_device = torch.device("cpu")
-    post_transforms = [
+    post_transforms_list: list[MapTransform] = [
             Invertd(
                 keys="pred", transform= pre_transforms, orig_keys="image",
                 meta_keys="pred_meta_dict", orig_meta_keys="image_meta_dict",
@@ -206,20 +176,20 @@ def main() -> None:
 
     test_files = [{"image": image} for image in image_paths]
 
-    post_transforms.extend([
+    post_transforms_list.extend([
         RemapLabels(keys=["pred"], id_map=inv_id_map)])
 
-    post_transforms = Compose(post_transforms)
+    post_transforms = Compose(post_transforms_list)
     state = torch.load(model_path, map_location="cpu", weights_only=True)
 
     model = UNet(
             spatial_dims=spatial_dims,
-            in_channels=in_channels,
+            in_channels=model_config.architecture.in_channels,
             out_channels=out_channels,
-            channels=channels,
-            act=act,
-            strides=strides,
-            num_res_units=num_res_units,
+            channels=model_config.architecture.channels,
+            act=model_config.architecture.act,
+            strides=model_config.architecture.strides,
+            num_res_units=model_config.architecture.num_res_units,
             norm=import_norm)
 
     model.load_state_dict(state)
@@ -231,16 +201,16 @@ def main() -> None:
     overlap_inference = args.overlap / 100
     if spatial_dims == 2:
         inferer = SliceInferer(
-            roi_size=roi_size,
-            sw_batch_size=spatial_window_batch_size,
+            roi_size=model_config.image.roi_size,
+            sw_batch_size=model_config.image.spatial_window_batch_size,
             spatial_dim=2,
             mode="gaussian",
             overlap=overlap_inference,
         )
     else:
         inferer = SlidingWindowInferer(
-            roi_size=roi_size,
-            sw_batch_size=spatial_window_batch_size,
+            roi_size=model_config.image.roi_size,
+            sw_batch_size=model_config.image.spatial_window_batch_size,
             mode="gaussian",
             overlap=overlap_inference,
         )
@@ -251,7 +221,7 @@ def main() -> None:
         try:
             run_inference(
                     test["image"],
-                    output_dir,
+                    output,
                     pre_transforms,
                     post_transforms,
                     amp_context,
@@ -264,7 +234,7 @@ def main() -> None:
                     )
             logging.info(f"Inference of {test} finished in {perf_counter()-t0:.2f}s")
         except Exception as e:
-            logging.exception(f"Error processing {test['image']}: {e}"),
+            logging.exception(f"Error processing {test['image']}: {e}")
             continue
 # %%
     logging.info("-" * 60)

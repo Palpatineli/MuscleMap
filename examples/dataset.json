@@ -1,0 +1,15 @@
+{
+    "description": " Segmentation",
+    "labels": {
+        "background": 0,
+        "NF1": 1
+    },
+    "name": "NF1CorStir",
+    "numTraining": 200,
+    "reference": "//emimbmsn01/data/nnUNet/nnUNet_raw/Dataset560",
+    "release": "0.0",
+    "channel_names": {
+        "0": "MR"
+    },
+    "file_ending": ".nii.gz"
+}

@@ -18,20 +18,21 @@ authors = [
   { name = "Steffen Bollmann" }
 ]
 dependencies = [
-  "monai>=1.3",
-  "torch>=2.4",
-  "numpy>=1.24",
-  "nibabel>=5.2",
-  "scikit-learn>=1.3",
-  "pandas>=2.0",
-  "scikit-image>=0.21",
-  "transforms3d>=0.4",
-  "tqdm>=4.67",
-  "matplotlib>=3.9",
-  "psutil>=6.1",
-  "portalocker>=3.1",
   "customtkinter>=5.2",
-  "Pillow>=11.3"
+  "mashumaro >= 3.22",
+  "matplotlib>=3.9",
+  "monai>=1.3",
+  "nibabel>=5.2",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "Pillow>=11.3",
+  "portalocker>=3.1",
+  "psutil>=6.1",
+  "scikit-image>=0.21",
+  "scikit-learn>=1.3",
+  "torch>=2.4",
+  "tqdm>=4.67",
+  "transforms3d>=0.4",
 ]
 
 [project.urls]
@@ -48,4 +49,4 @@ mm_register_to_template = "muscle_map.mm_register_to_template:main"
 packages = ["muscle_map"]
 
 [tool.setuptools.package-data]
-muscle_map = ["py.typed"]
+muscle_map = ["py.typed", "*.json"]

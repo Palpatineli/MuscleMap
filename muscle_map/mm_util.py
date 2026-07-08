@@ -1,31 +1,105 @@
+from importlib.abc import Traversable
+from typing import Any, Literal, NotRequired, Self, TypedDict, cast
 import os
 import logging
 import sys
 import json
 import math
+from dataclasses import dataclass, field
 import hashlib
 import tempfile
 import urllib.request
 import numpy as np
-import nibabel as nib
+import numpy.typing as npt
+from nibabel import save, load, Nifti1Header, Nifti1Image
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
-from monai.transforms import (MapTransform)
-import gc, torch
+from monai.transforms.transform import MapTransform
+import gc
+import torch
 import shutil
 import psutil
 from scipy import ndimage as ndi
-from typing import Any, Dict, Optional, Tuple, Union
+from mashumaro.mixins.json import DataClassJSONMixin
 from pathlib import Path
-import pandas as pd
 from tqdm import tqdm
 
 _MODELS_DIR = Path(__file__).parent / "models"
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
+class JSONLoaderMixin(DataClassJSONMixin):
+    @classmethod
+    def load_config(cls, json_path: Path | Traversable, **kwargs) -> Self:
+        with json_path.open() as f:
+            json_data = json.load(f)
+        for key, value in kwargs.items():
+            json_data[key] = value
+        return cls.from_dict(json_data)  # pyright: ignore[reportUnknownMemberType]
+
+@dataclass
+class DatasetParameter(JSONLoaderMixin):
+    # compatible with the dataset.json file from nnunetv2
+    description: str
+    labels: dict[str, int]
+    name: str
+    numTraining: int
+    reference: str
+    release: str
+    channel_names: dict[str, str]
+    file_ending: str
+
+@dataclass
+class ArchitectureConfig:
+    # minimal config for monai unet
+    version: str
+    spatial_dims: Literal[2, 3]
+    in_channels: int
+    channels: list[int]
+    act: str
+    strides: list[int]
+    num_res_units: int
+    norm: str
+
+@dataclass
+class ImageParameter:
+    roi_size: list[int]
+    spatial_window_batch_size: int
+    train_patch_size: list[int]
+    spacing: tuple[float, float, float]
+
+@dataclass
+class TrainParameter:
+    batch_size: int
+    samples_per_volume: int
+    num_workers: int
+    learning_rate: float = field(default=1E-4)
+    weight_decay: float = field(default=1E-5)
+    seed: int = field(default=2026)
+    rotation_degrees: int = field(default=15)
+
+@dataclass
+class ModelConfig(JSONLoaderMixin):
+    architecture: ArchitectureConfig
+    image: ImageParameter
+    training: TrainParameter
+    dataset: DatasetParameter
+
+@dataclass
+class DatasetStats(JSONLoaderMixin):
+    dataset_dir: Path
+    num_cases: int
+    spacings: list[list[float]]
+    sizes: list[list[int]]
+
 # concept_id: the Zenodo "concept record ID" that always points to all versions.
 # Fill these in after publishing each model on Zenodo.
-ZENODO_MODELS: Dict[str, Dict[str, str]] = {
+class ModelMeta(TypedDict):
+    record_id: str
+    versions: NotRequired[dict[str, str]]
+    pth_filename: str
+    json_filename: str
+
+ZENODO_MODELS: dict[str, ModelMeta] = {
     "abdomen": {
         "record_id": "19631081",
         "pth_filename": "contrast_agnostic_abdomen_model.pth",
@@ -65,16 +139,18 @@ ZENODO_MODELS: Dict[str, Dict[str, str]] = {
 }
 
 
+
+
 def _get_model_cache_dir(region: str, version: str) -> Path:
     return _MODELS_DIR / region / f"v{version}"
 
 
-def _latest_cached_version(region: str, pth_filename: str, json_filename: str) -> Path:
+def _latest_cached_version(region: str, pth_filename: str, json_filename: str) -> Path | None:
     """Return the cache dir of the most recent locally cached version, or None."""
     region_dir = _MODELS_DIR / region
     if not region_dir.is_dir():
         return None
-    candidates = []
+    candidates: list[Path] = []
     for d in region_dir.iterdir():
         if d.is_dir() and (d / pth_filename).exists() and (d / json_filename).exists():
             candidates.append(d)
@@ -84,7 +160,7 @@ def _latest_cached_version(region: str, pth_filename: str, json_filename: str) -
     return sorted(candidates, key=lambda p: p.name)[-1]
 
 
-def _zenodo_get(url: str) -> dict:
+def _zenodo_get(url: str) -> dict[str, Any]:
     """GET a Zenodo API URL and return parsed JSON, or raise ConnectionError."""
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
@@ -94,7 +170,7 @@ def _zenodo_get(url: str) -> dict:
         raise ConnectionError(f"Zenodo API request failed ({url}): {type(e).__name__}: {e}") from e
 
 
-def _fetch_zenodo_latest(record_id: str) -> tuple:
+def _fetch_zenodo_latest(record_id: str) -> tuple[str, dict[str, str]]:
     """Fetch the latest version from Zenodo. Returns (resolved_version, {filename: url})."""
     data = _zenodo_get(f"https://zenodo.org/api/records/{record_id}/versions/latest")
     resolved_version = data.get("metadata", {}).get("version", "unknown")
@@ -102,7 +178,7 @@ def _fetch_zenodo_latest(record_id: str) -> tuple:
     return resolved_version, file_urls
 
 
-def _fetch_zenodo_version(version_record_id: str) -> tuple:
+def _fetch_zenodo_version(version_record_id: str) -> tuple[str, dict[str, str]]:
     """Fetch a specific version record from Zenodo. Returns (version, {filename: url})."""
     data = _zenodo_get(f"https://zenodo.org/api/records/{version_record_id}")
     resolved_version = data.get("metadata", {}).get("version", "unknown")
@@ -118,10 +194,10 @@ def _verify_sha256(path: Path, expected: str) -> bool:
     return h.hexdigest() == expected
 
 
-class _DownloadProgress(tqdm):
+class _DownloadProgress(tqdm):  # pyright: ignore[reportMissingTypeArgument]
     def update_to(self, block_count=1, block_size=1, total=-1):
         if total >= 0:
-            self.total = total
+            self.total: int = total
         self.update(block_count * block_size - self.n)
 
 
@@ -143,7 +219,7 @@ def _download_file(url: str, dest: Path, sha256: str = "") -> None:
         raise
 
 
-def check_for_model_update(region: str) -> tuple:
+def check_for_model_update(region: str) -> tuple[str | None, str | None]:
     """
     Check whether a newer model version is available on Zenodo.
     Returns (cached_version_or_None, zenodo_version_or_None).
@@ -152,7 +228,7 @@ def check_for_model_update(region: str) -> tuple:
     model_info = ZENODO_MODELS.get(region)
     if not model_info:
         return None, None
-    record_id    = model_info["record_id"]
+    record_id = model_info["record_id"]
     pth_filename = model_info["pth_filename"]
     json_filename = model_info["json_filename"]
     cached_dir = _latest_cached_version(region, pth_filename, json_filename)
@@ -164,7 +240,7 @@ def check_for_model_update(region: str) -> tuple:
     return cached_v, zenodo_v
 
 
-def ensure_model_downloaded(region: str, version: str = "latest") -> tuple:
+def ensure_model_downloaded(region: str, version: str = "latest") -> tuple[Path, Path]:
     """
     Ensure both .pth and .json for *region* are cached locally.
     Returns (pth_path, json_path).
@@ -181,11 +257,11 @@ def ensure_model_downloaded(region: str, version: str = "latest") -> tuple:
     if record_id == "XXXXXXX":
         logging.error(
             f"Zenodo record ID for '{region}' has not been configured yet. "
-            f"Please update ZENODO_MODELS in mm_util.py after publishing."
+            + "Please update ZENODO_MODELS in mm_util.py after publishing."
         )
         sys.exit(1)
 
-    def _use_cached_fallback(reason: str) -> tuple:
+    def _use_cached_fallback(reason: str) -> tuple[Path, Path]:
         """Fall back to the highest locally cached version, or exit if none exists."""
         cached_dir = _latest_cached_version(region, pth_filename, json_filename)
         if cached_dir is not None:
@@ -193,7 +269,7 @@ def ensure_model_downloaded(region: str, version: str = "latest") -> tuple:
             return cached_dir / pth_filename, cached_dir / json_filename
         logging.error(
             f"{reason} No cached model found for '{region}'. "
-            f"Please run MuscleMap with an internet connection at least once to download the model."
+            + "Please run MuscleMap with an internet connection at least once to download the model."
         )
         sys.exit(1)
 
@@ -249,15 +325,15 @@ def ensure_model_downloaded(region: str, version: str = "latest") -> tuple:
         if cached_v != resolved_version:
             logging.info(
                 f"New '{region}' model version available: v{resolved_version} "
-                f"(current: v{cached_v}). Downloading automatically. "
-                f"To keep a specific version, use --model_version {cached_v}."
+                + f"(current: v{cached_v}). Downloading automatically. "
+                + f"To keep a specific version, use --model_version {cached_v}."
             )
 
     for filename, dest in [(pth_filename, pth_path), (json_filename, json_path)]:
         if filename not in file_urls:
             logging.error(
                 f"File '{filename}' not found in Zenodo record v{resolved_version}. "
-                f"Available files: {list(file_urls.keys())}"
+                + f"Available files: {list(file_urls.keys())}"
             )
             sys.exit(1)
         logging.info(f"Downloading '{filename}' (v{resolved_version}) from Zenodo...")
@@ -265,13 +341,13 @@ def ensure_model_downloaded(region: str, version: str = "latest") -> tuple:
 
     logging.info(
         f"'{region}' model v{resolved_version} downloaded successfully. "
-        f"To use a different version, use --model_version <version>."
+        + "To use a different version, use --model_version <version>."
     )
     return pth_path, json_path
 
 # concept_id: the Zenodo "concept record ID" that always points to all versions.
 # Fill these in after publishing each template set on Zenodo.
-ZENODO_TEMPLATES: Dict[str, Dict[str, str]] = {
+ZENODO_TEMPLATES: dict[str, dict[str, str]] = {
     "abdomen": {
         "record_id": "20043147",
     },
@@ -294,7 +370,7 @@ def ensure_template_downloaded(region: str) -> Path:
     if record_id == "XXXXXXX":
         logging.error(
             f"Zenodo record ID for '{region}' templates has not been configured yet. "
-            f"Please update ZENODO_TEMPLATES in mm_util.py after publishing."
+            + "Please update ZENODO_TEMPLATES in mm_util.py after publishing."
         )
         sys.exit(1)
 
@@ -312,7 +388,7 @@ def ensure_template_downloaded(region: str) -> Path:
     except ConnectionError as e:
         logging.error(
             f"Could not reach Zenodo to download '{region}' templates: {e}\n"
-            f"Please run mm_register_to_template with an internet connection at least once."
+            + "Please run mm_register_to_template with an internet connection at least once."
         )
         sys.exit(1)
 
@@ -341,7 +417,7 @@ AUTO_CHUNK_CPU_ESTIMATE_OVERHEAD = 2.00
 AUTO_CHUNK_CPU_MAX_LOGIT_BYTES = 2 * 1024**3
 AUTO_CHUNK_CPU_LOGIT_FRACTION = 0.25
 
-#check_image_exists 
+#check_image_exists
 def check_image_exists(image_path):
     if not os.path.isfile(image_path):
         logging.error(f"Image file '{image_path}' does not exist or is not a file.")
@@ -350,13 +426,12 @@ def check_image_exists(image_path):
         logging.error(f"Image file '{image_path}' is not readable.")
         sys.exit(1)
 
-def get_config_path(region: str, version: str = "latest") -> str:
+def get_config_path(region: str, version: str = "latest") -> Path:
     """Return the JSON config path for a region, downloading from Zenodo if needed."""
     _, json_path = ensure_model_downloaded(region, version)
-    return str(json_path)
+    return json_path
 
-
-def get_model_and_config_paths(region, specified_model=None, version: str = "latest"):
+def get_model_and_config_paths(region: str, specified_model: str, version: str = "latest") -> tuple[str, str]:
     if specified_model:
         model_path  = specified_model
         config_path = os.path.splitext(model_path)[0] + ".json"
@@ -391,11 +466,9 @@ def get_template_paths(region, specified_template=None):
 
     return template_path, template_segmentation_path
 
-def load_model_config(config_path):
+def load_model_config(config_path: Path) -> ModelConfig:
     try:
-        with open(config_path, 'r') as file:
-            config = json.load(file)
-        return config
+        return ModelConfig.load_config(config_path)
     except FileNotFoundError:
         logging.error(f"Error: The configuration file '{config_path}' was not found.")
         sys.exit(1)
@@ -403,26 +476,7 @@ def load_model_config(config_path):
         logging.error(f"Error parsing the configuration file: {exc}")
         sys.exit(1)
 
-def validate_seg_arguments(args):
-    required_args = {'input_image': "-i", 'region': "-r"}
-    for arg_name, flag in required_args.items():
-        arg_value = getattr(args, arg_name, None)
-        if not arg_value:
-            logging.error(f"Error: The {arg_name} ({flag}) argument is required.")
-            sys.exit(1)
-        if not isinstance(arg_value, str):
-            logging.error(f"Error: The {arg_name} ({flag}) argument must be a string.")
-            sys.exit(1)
-
-    # Optional arguments validation
-    optional_args = {'model': "-m"}
-    for arg_name, flag in optional_args.items():
-        arg_value = getattr(args, arg_name, None)
-        if arg_value and not isinstance(arg_value, str):
-            logging.error(f"Error: The {arg_name} ({flag}) argument must be a string.")
-            sys.exit(1)
-
-def _format_bytes(num_bytes: int) -> str:
+def _format_bytes(num_bytes: int | float) -> str:
     if num_bytes < 1024:
         return f"{num_bytes} B"
     units = ("KiB", "MiB", "GiB", "TiB")
@@ -433,7 +487,7 @@ def _format_bytes(num_bytes: int) -> str:
             return f"{value:.1f} {unit}"
     return f"{value:.1f} PiB"
 
-def _release_memory(device=None):
+def _release_memory(device: torch.device | None = None):
     gc.collect()
     if device is not None and device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -574,9 +628,9 @@ def _get_system_memory_budget():
 
     return free_bytes, total_bytes, source
 
-def estimate_auto_chunk_size(image_path, device, out_channels=None, target_pixdim=None):
-    img_nii = nib.load(image_path)
-    header = img_nii.header
+def estimate_auto_chunk_size(image_path, device: torch.device | None, out_channels=None, target_pixdim=None):
+    img_nii = load(image_path)
+    header = cast(Nifti1Header, img_nii.header)
     dims = header.get_data_shape()[:3]
     zooms = header.get_zooms()[:3]
     del img_nii
@@ -592,7 +646,7 @@ def estimate_auto_chunk_size(image_path, device, out_channels=None, target_pixdi
 
     memory_source = system_source
     if device is not None and device.type == "cuda" and torch.cuda.is_available():
-        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        device_index = device.index if device.index is not None else torch.cuda.current_device()  # pyright: ignore[reportUnnecessaryComparison]
         free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
         reserve_bytes = max(AUTO_CHUNK_GPU_MIN_RESERVE_BYTES, int(total_bytes * 0.10))
         safety_margin = AUTO_CHUNK_GPU_SAFETY_MARGIN
@@ -609,7 +663,7 @@ def estimate_auto_chunk_size(image_path, device, out_channels=None, target_pixdi
     if usable_bytes <= 0:
         logging.warning(
             "Auto chunk sizing found no free headroom after reserves; falling back to 1 slice "
-            f"(free={_format_bytes(free_bytes)} reserve={_format_bytes(reserve_bytes)})."
+            + f"(free={_format_bytes(free_bytes)} reserve={_format_bytes(reserve_bytes)})."
         )
         return 1
 
@@ -676,11 +730,11 @@ def estimate_auto_chunk_size(image_path, device, out_channels=None, target_pixdi
     return estimated_chunk
 
 def _run_inference_on_file(
-    image_path,
+    image_path: Path,
     pre_transforms,
     post_transforms,
     amp_context,
-    device,
+    device: torch.device,
     inferer,
     model,
 ):
@@ -719,22 +773,22 @@ def _run_inference_on_file(
         del data, tensor, pred, single_pred, post_in, post_out, seg_tensor
         _release_memory(device)
 
-def _write_temp_chunk(image_proxy, affine, header, temp_dir, start, end):
+def _write_temp_chunk(image_proxy, affine, header, temp_dir: Path, start, end):
     vol_chunk = np.asarray(image_proxy.dataobj[..., start:end], dtype=np.float32)
-    chunk_path = os.path.join(temp_dir, f"chunk_{start}_{end}.nii")
-    nib.save(nib.Nifti1Image(vol_chunk, affine, header.copy()), chunk_path)
+    chunk_path = temp_dir.joinpath(f"chunk_{start}_{end}.nii")
+    save(Nifti1Image(vol_chunk, affine, header.copy()), chunk_path)
     del vol_chunk
     return chunk_path
 
-def save_nifti(data: np.ndarray, affine, header, out_path):
-    new_hdr = header.copy()                            
-    img = nib.Nifti1Image(data, affine, new_hdr)
-    
+def save_nifti(data: np.ndarray, affine: npt.NDArray[np.float32], header: Nifti1Header, out_path):
+    new_hdr = header.copy()
+    img = Nifti1Image(data, affine, new_hdr)
+
     _, qcode = header.get_qform(coded=True)
     _, scode = header.get_sform(coded=True)
     img.set_qform(affine, int(qcode))
     img.set_sform(affine, int(scode))
-    nib.save(img, out_path)
+    save(img, out_path)
 
 def validate_extract_args(args):
     if args.method == 'dixon':
@@ -766,38 +820,38 @@ def validate_register_to_template_args(args):
             logging.error(f"Error: The {arg_name} argument must be a string.")
             sys.exit(1)
 
-def extract_image_data(image_path):
-    img = nib.load(image_path)
+def extract_image_data(image_path: Path) -> tuple[Nifti1Image, npt.NDArray[np.float32], npt.NDArray[np.float32], Nifti1Header, tuple[int, int, int], tuple[int, int, int]]:
+    img = load(image_path)
     img_array = img.get_fdata()
-    
-    dim_x, dim_y, dim_z = img.header['dim'][1:4] #dim_z = number of axial slices
-    pixdim_x, pixdim_y, pixdim_z = img.header['pixdim'][1:4] #voxel dimensions in mm
+
+    header = cast(Nifti1Header, img.header)
+    dim_x, dim_y, dim_z = header['dim'][1:4] #dim_z = number of axial slices
+    pixdim_x, pixdim_y, pixdim_z = header['pixdim'][1:4] #voxel dimensions in mm
     affine = img.affine
-    header = img.header
-    
-    return img, img_array,affine,header,(dim_x, dim_y, dim_z), (pixdim_x, pixdim_y, pixdim_z)
+    header = cast(Nifti1Header, img.header)
+    return img, img_array, affine, header, (dim_x, dim_y, dim_z), (pixdim_x, pixdim_y, pixdim_z)
 
 def add_slice_counts(
-    results_entry: Dict[int, Dict[str, Any]],
+    results_entry: dict[int, dict[str, Any]],
     label_img:     np.ndarray,
-    pix_dim:       Tuple[float, float, float],
+    pix_dim:       tuple[float, float, float],
     col_name:      str = "Slices with segmentation",
-) -> Dict[int, Dict[str, Any]]:
-    
+) -> dict[int, dict[str, Any]]:
+
     if label_img.ndim != 3:
         raise ValueError("label_img must be 3-D")
-    
-    pix_dim = tuple(float(p) for p in pix_dim)
-    max_axis = int(np.argmax(pix_dim))                
-    if max(pix_dim) / min(pix_dim) < 1.01:           
-        max_axis = 2                                
+
+    pix_dim = cast(tuple[float, float, float], tuple(float(p) for p in pix_dim))
+    max_axis = int(np.argmax(pix_dim))
+    if max(pix_dim) / min(pix_dim) < 1.01:
+        max_axis = 2
     axes_to_reduce = tuple(ax for ax in range(3) if ax != max_axis)
 
     for lbl in np.unique(label_img):
         lbl = int(lbl)
         if lbl == 0:
             continue
-        slice_present = np.any(label_img == lbl, axis=axes_to_reduce)  
+        slice_present = np.any(label_img == lbl, axis=axes_to_reduce)
         slice_count   = int(slice_present.sum())
 
         entry = results_entry.get(lbl, {"Label": lbl, "Anatomy": ""})
@@ -806,10 +860,10 @@ def add_slice_counts(
 
     return results_entry
 
-def apply_clustering(args, mask_img, components): 
+def apply_clustering(args, mask_img, components):
     if args.method == 'kmeans':
         clustering = KMeans(n_clusters = components, init = 'k-means++', tol = 0.001, n_init = 20, max_iter = 1000).fit(mask_img)
-        labels = clustering.labels_ 
+        labels = clustering.labels_
     elif args.method == 'gmm':
         clustering = GaussianMixture(n_components = components, covariance_type = 'full', init_params = 'kmeans', tol = 0.001, n_init = 20, max_iter = 1000).fit(mask_img)
         labels = clustering.predict(mask_img)
@@ -817,28 +871,11 @@ def apply_clustering(args, mask_img, components):
         raise ValueError("Either KMeans or GMM must be activated.")
     return labels, clustering
 
-def calculate_thresholds(labels, mask_img, num_clusters):
-    clusters = [mask_img[labels == i] for i in range(num_clusters)]
-    means = [np.mean(cluster) for cluster in clusters]
-    if num_clusters == 2:
-        muscle_max = np.max(clusters[0]) if means[0] < means[1] else np.max(clusters[1])
-        muscle_img = mask_img[mask_img <= muscle_max]
-        fat_min = None # placeholder
-        sorted_indices = [0, 1] if means[0] < means[1] else [1, 0]
-    elif num_clusters == 3:
-        sorted_clusters = sorted(zip(means, clusters, range(len(clusters))), key=lambda x: x[0])
-        muscle_img = sorted_clusters[0][1]
-        fat_img = sorted_clusters[2][1]
-        muscle_max = np.max(muscle_img)
-        fat_min= np.min(fat_img)
-        sorted_indices = [x[2] for x in sorted_clusters]
-    return muscle_max, fat_min, sorted_indices
-
 def create_image_array(img_array, mask_array, label, muscle_upper, fat_lower, components):
     if components not in (2, 3):
         raise ValueError("components must be 2 or 3")
 
-    muscle_label = (mask_array == label) 
+    muscle_label = (mask_array == label)
     if components == 2:
         muscle_array    = muscle_label & (img_array <  muscle_upper)
         fat_array       = muscle_label & (img_array >= muscle_upper)
@@ -849,40 +886,27 @@ def create_image_array(img_array, mask_array, label, muscle_upper, fat_lower, co
         fat_array       = muscle_label & (img_array >= fat_lower)
     return muscle_array, fat_array, undefined_array
 
-def create_output_dir(output_dir=None):
+def create_output_dir(output_dir: Path | None = None):
     if not output_dir:
-        output_dir = os.getcwd()  # Use the current working directory if no output directory is provided
+        output_dir = Path.cwd()  # Use the current working directory if no output directory is provided
     else:
         # Construct the path to the output directory from the current working directory
-        output_dir = os.path.abspath(output_dir)
+        output_dir = output_dir.absolute()
 
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    if not output_dir.exists():
+        output_dir.mkdir()
         logging.info(f"Output directory {output_dir} created")
     return output_dir
 
 def build_entry_dict_metrics(
     label_img: np.ndarray,
-    model_config: Optional[dict],
+    model_config: ModelConfig,
     region: bool = False,
-) -> Dict[int, Dict[str, Any]]:
-    
-    results_entry: Dict[int, Dict[str, Any]] = {}
+) -> dict[int, dict[str, Any]]:
 
-    model_labels = (model_config.get("labels", []) if model_config else [])
-    idx: Dict[int, str] = {}
+    results_entry: dict[int, dict[str, Any]] = {}
 
-    if region and model_labels:
-        for L in model_labels:
-            try:
-                val = int(L.get("value"))
-            except Exception:
-                continue
-            anatomy = str(L.get("anatomy", "")).strip()
-            side    = str(L.get("side", "")).strip()
-            text = f"{anatomy} {side}".strip()
-            if text:
-                idx[val] = text
+    idx = {v: k.lower().replace(' ', '_') for k, v in model_config.dataset.labels.items()}
 
     unmatched_labels: list[int] = []
     for lbl in np.unique(label_img):
@@ -902,30 +926,30 @@ def build_entry_dict_metrics(
     if region and idx and unmatched_labels:
         logging.warning(
             "No MuscleMap anatomy-side mapping was found for the following label IDs in "
-            "the current region configuration: %s. Only label numbers will be given",
+            + "the current region configuration: %s. Only label numbers will be given",
             ", ".join(map(str, unmatched_labels))
         )
 
     return results_entry
 
 def calculate_metrics_dixon(
-    result_entry: Dict[int, Dict[str, Any]], 
+    result_entry: dict[int, dict[str, Any]],
     label_img: np.ndarray,
     fat_array: np.ndarray,
     water_array: np.ndarray,
-    pix_dim: Tuple[float, float, float],
-) -> Dict[int, Dict[str, Any]]:
-    
+    pix_dim: tuple[float, float, float],
+) -> dict[int, dict[str, Any]]:
+
     # raise value error when shapes do no match or when 4D is given as input
     if not (label_img.shape == water_array.shape == fat_array.shape):
         raise ValueError("Shape mismatch: segmentation image, water image, and fat image must have identical shapes.")
     if len(pix_dim) != 3:
-        raise ValueError("pix_dim must be a 3-tuple (mm, mm, mm)")
-    
+        raise ValueError("pix_dim must be a 3-tuple (mm, mm, mm)")  # pyright: ignore[reportUnreachable]
+
     # fix voxel_vol_ml to calculate volume in ml
     voxel_vol_ml = (pix_dim[0] * pix_dim[1] * pix_dim[2]) / 1000.0
 
-    # 1) Creating total fat fraction map for formula fat_signal/fat_signal + water signal. 
+    # 1) Creating total fat fraction map for formula fat_signal/fat_signal + water signal.
     denom = fat_array + water_array
     ff_map = np.divide(
         fat_array, denom,
@@ -948,12 +972,12 @@ def calculate_metrics_dixon(
     with np.errstate(divide='ignore', invalid='ignore'):
         mean_per_lbl = np.divide(
             sum_per_lbl, count_per_lbl,
-            out=np.zeros_like(sum_per_lbl, dtype=np.float64),
+            out=np.zeros_like(sum_per_lbl, dtype=np.float32),
             where=(count_per_lbl != 0)
         )
     # 6) Update result_entry with fat percentages for each label
     for _k, entry in result_entry.items():
-        lbl = int(entry.get("Label", _k))  
+        lbl = int(entry.get("Label", _k))
         if lbl == 0:
             continue
         if lbl <= max_label and count_per_lbl[lbl] > 0:
@@ -970,26 +994,26 @@ def calculate_metrics_dixon(
     return result_entry
 
 def calculate_metrics_average(
-    result_entry: Dict[int, Dict[str, Any]],
+    result_entry: dict[int, dict[str, Any]],
     label_img: np.ndarray,
     img_array: np.ndarray,
-    pix_dim: Tuple[float, float, float],
-) -> Dict[int, Dict[str, Any]]:
-    
+    pix_dim: tuple[float, float, float],
+) -> dict[int, dict[str, Any]]:
+
     #Raise ValueError when mismatch or image not in 3D
     if label_img.shape != img_array.shape:
         raise ValueError("Shape mismatch: Segmentation image and img_array must have the same shape")
     if len(pix_dim) != 3:
-        raise ValueError("pix_dim must be a 3-tuple (mm, mm, mm)")
-    
-    # fix voxel_vol_ml to calculate volume in ml 
+        raise ValueError("pix_dim must be a 3-tuple (mm, mm, mm)")  # pyright: ignore[reportUnreachable]
+
+    # fix voxel_vol_ml to calculate volume in ml
     voxel_vol_ml = (pix_dim[0] * pix_dim[1] * pix_dim[2]) / 1000.0
 
     # Vectorized aggregations
     flat_lbl = label_img.astype(np.int64).ravel()
-    flat_val = img_array.astype(np.float64).ravel()
+    flat_val = img_array.astype(np.float32).ravel()
     max_label = int(flat_lbl.max()) if flat_lbl.size else 0
-    
+
     # Vectorized calculations for sum and count
     sum_per_lbl   = np.bincount(flat_lbl, weights=flat_val, minlength=max_label + 1)
     count_per_lbl = np.bincount(flat_lbl, minlength=max_label + 1)
@@ -998,7 +1022,7 @@ def calculate_metrics_average(
     with np.errstate(divide='ignore', invalid='ignore'):
         mean_per_lbl = np.divide(
             sum_per_lbl, count_per_lbl,
-            out=np.zeros_like(sum_per_lbl, dtype=np.float64),
+            out=np.zeros_like(sum_per_lbl, dtype=np.float32),
             where=(count_per_lbl != 0)
         )
     labels_present = np.flatnonzero(count_per_lbl)
@@ -1016,7 +1040,7 @@ def calculate_metrics_average(
         result_entry[int(lbl)] = entry
 
     for _k, entry in list(result_entry.items()):
-        lbl = int(entry.get("Label", _k))  
+        lbl = int(entry.get("Label", _k))
         if lbl == 0:
             continue
         if lbl > max_label or count_per_lbl[lbl] == 0:
@@ -1024,227 +1048,6 @@ def calculate_metrics_average(
             entry.setdefault("Volume (ml)",       np.nan)
 
     return result_entry
-
-def _build_anatomy_groups(
-    model_config: Optional[dict],
-    results_entry: Dict[int, Dict[str, Any]],
-    cluster_data: dict,
-) -> "dict[str, list[int]]":
-    """
-    Groups cluster_data labels by anatomy name (left + right together).
-
-    Priority:
-    1. model_config: groups on `anatomy` field (without side), Title Case.
-    2. results_entry fallback: strips trailing ' left' / ' right' from anatomy string.
-    3. Last resort: 'Label <id>'.
-    """
-    _SIDES = (" left", " right", " Left", " Right")
-
-    groups: "dict[str, list[int]]" = {}
-
-    if model_config:
-        for L in model_config.get("labels", []):
-            try:
-                val = int(L.get("value"))
-            except Exception:
-                continue
-            if val not in cluster_data:
-                continue
-            anatomy = str(L.get("anatomy", "")).strip().title() or f"Label {val}"
-            groups.setdefault(anatomy, []).append(val)
-
-    # Cover labels not matched by model_config (or when model_config is None)
-    for lbl in cluster_data:
-        if any(lbl in g for g in groups.values()):
-            continue
-        raw = results_entry.get(lbl, {}).get("Anatomy", "")
-        if raw:
-            for suffix in _SIDES:
-                if raw.endswith(suffix):
-                    raw = raw[: -len(suffix)]
-                    break
-            anatomy = raw.strip().title()
-        else:
-            anatomy = f"Label {lbl}"
-        groups.setdefault(anatomy, []).append(lbl)
-
-    return groups
-
-
-def calculate_metrics_thresholding(
-    args,
-    results_entry: Dict[str, Any],
-    label_img: np.ndarray,
-    img_array: np.ndarray,
-    affine: np.ndarray,
-    header:  np.ndarray,
-    pix_dim: Tuple[float, float, float],
-    components: int,
-    output_dir: Union[str, Path],
-    id_part: str = "",
-    qc: bool = False,
-    model_config: Optional[dict] = None,
-) -> Dict[str, Any]:
-    
-    # raise value errors if components is not 2/3 or when mismatch in shape
-    if components not in (2, 3):
-        raise ValueError("components must be 2 or 3")
-    if label_img.shape != img_array.shape:
-        raise ValueError("label_img and img_array must have the same shape")
-    
-    #prepare empty image array to build up the fat, muscle (and in 3 component; undefined)maps
-    total_muscle_image    = np.zeros_like(img_array, dtype=bool)
-    total_fat_image       = np.zeros_like(img_array, dtype=bool)
-    total_undefined_image = np.zeros_like(img_array, dtype=bool)
-    combined_mask = np.zeros_like(label_img, dtype=np.uint8)
-
-    # if GMM is chosen, we will also create an empty array in float32 for each component to store softprob.
-    if args.method == 'gmm':
-        total_probability_maps = [np.zeros(label_img.shape, dtype=np.float32)
-                                for _ in range(components)]
-
-    # determine voxel vol ml to easily calculate volume from pixdim
-    voxel_vol_ml = (pix_dim[0] * pix_dim[1] * pix_dim[2]) / 1000.0
-
-    # --- Phase 1: cluster all labels and collect thresholds ---
-    # cluster_data: {lbl: (muscle_max, fat_min, sorted_indices, clustering, mask_img_1d, mask_3d)}
-    cluster_data = {}
-    for lbl in np.unique(label_img):
-        if lbl == 0:
-            continue
-        mask    = (label_img == lbl)
-        mask_img = img_array[mask].reshape(-1, 1)
-        labels_cl, clustering = apply_clustering(args, mask_img, components)
-        muscle_max, fat_min, sorted_indices = calculate_thresholds(labels_cl, mask_img, components)
-        cluster_data[int(lbl)] = (muscle_max, fat_min, sorted_indices, clustering, mask_img, mask)
-
-    # --- QC: one window per anatomy group (left + right combined) ---
-    erased_masks: Dict[int, np.ndarray] = {}   # {lbl: 3D bool mask}
-    if qc:
-        from muscle_map.mm_qc_gui import QCManager
-        _qc_manager = QCManager()
-        anatomy_groups = _build_anatomy_groups(model_config, results_entry, cluster_data)
-        for anatomy_name, group_lbls in anatomy_groups.items():
-            group_thresholds = {lbl: (cluster_data[lbl][0], cluster_data[lbl][1]) for lbl in group_lbls}
-            muscle_delta, fat_delta, erased_mask = _qc_manager.show(
-                img_array, label_img, group_thresholds, components, anatomy_name
-            )
-            for lbl in group_lbls:
-                d = cluster_data[lbl]
-                cluster_data[lbl] = (
-                    d[0] + muscle_delta,
-                    (d[1] + fat_delta) if d[1] is not None else None,
-                    d[2], d[3], d[4], d[5],
-                )
-                if erased_mask.any():
-                    erased_masks[lbl] = erased_mask
-            if _qc_manager.quit_requested:
-                break
-        _qc_manager.destroy()
-
-    # --- Phase 2: compute metrics and build output maps ---
-    for lbl, (muscle_max, fat_min, sorted_indices, clustering, mask_img, mask) in cluster_data.items():
-        if lbl in erased_masks:
-            mask     = mask & ~erased_masks[lbl]
-            mask_img = img_array[mask].reshape(-1, 1)
-        N            = mask_img.size
-        total_volume = N * voxel_vol_ml
-
-        erased = erased_masks.get(lbl)
-
-        if components == 2:
-            muscle_array, fat_array, _ = create_image_array(img_array, label_img, lbl, muscle_max, fat_min, components)
-            if erased is not None:
-                muscle_array = muscle_array & ~erased
-                fat_array    = fat_array    & ~erased
-            total_muscle_image |= muscle_array
-            total_fat_image    |= fat_array
-            combined_mask[muscle_array] = 1
-            combined_mask[fat_array]    = 4
-
-            muscle_percentage = 100.0 * np.mean((mask_img.ravel() <= muscle_max))
-            fat_percentage    = 100 - muscle_percentage
-            muscle_voxels     = np.count_nonzero(mask_img <= muscle_max)
-            muscle_volume     = muscle_voxels * voxel_vol_ml
-            fat_volume        = (N - muscle_voxels) * voxel_vol_ml
-
-        if components == 3:
-            muscle_array, fat_array, undefined_array = create_image_array(img_array, label_img, lbl, muscle_max, fat_min, components)
-            if erased is not None:
-                muscle_array    = muscle_array    & ~erased
-                fat_array       = fat_array       & ~erased
-                undefined_array = undefined_array & ~erased
-            total_muscle_image    |= muscle_array
-            total_fat_image       |= fat_array
-            total_undefined_image |= undefined_array
-            combined_mask[muscle_array]    = 1
-            combined_mask[undefined_array] = 7
-            combined_mask[fat_array]       = 4
-
-            muscle_percentage    = np.nan if N == 0 else 100.0 * np.mean(mask_img <  muscle_max)
-            undefined_percentage = np.nan if N == 0 else 100.0 * np.mean((mask_img >= muscle_max) & (mask_img < fat_min))
-            fat_percentage       = np.nan if N == 0 else 100.0 * np.mean(mask_img >= fat_min)
-            muscle_voxels        = np.count_nonzero(mask_img <= muscle_max)
-            muscle_volume        = muscle_voxels * voxel_vol_ml
-            undefined_voxels     = np.count_nonzero((mask_img > muscle_max) & (mask_img < fat_min))
-            undefined_volume     = undefined_voxels * voxel_vol_ml
-            fat_voxels           = np.count_nonzero(mask_img >= fat_min)
-            fat_volume           = fat_voxels * voxel_vol_ml
-
-        entry = results_entry.get(lbl, {"Anatomy": "", "Label": lbl})
-        entry.update({
-            "Muscle (%)":         (np.nan if muscle_percentage is None else round(float(muscle_percentage), 2)),
-            "Fat (%)":            (np.nan if fat_percentage is None else round(float(fat_percentage), 2)),
-            "Total volume (ml)":  (np.nan if total_volume is None else round(float(total_volume), 2)),
-            "Fat volume (ml)":    (np.nan if fat_volume is None else round(float(fat_volume), 2)),
-            "Muscle volume (ml)": (np.nan if muscle_volume is None else round(float(muscle_volume), 2)),
-        })
-        if components == 3:
-            entry["Undefined (%)"]         = (np.nan if undefined_percentage is None else round(float(undefined_percentage), 2))
-            entry["Undefined volume (ml)"] = (np.nan if undefined_volume     is None else round(float(undefined_volume),     2))
-        results_entry[lbl] = entry
-
-        if args.method == 'gmm':
-            probability_maps        = clustering.predict_proba(mask_img)
-            sorted_probability_maps = probability_maps[:, sorted_indices]
-            for comp_idx in range(components):
-                total_probability_maps[comp_idx][mask] += sorted_probability_maps[:, comp_idx].astype(np.float32)
-
-    save_nifti(total_muscle_image.astype(np.uint8), affine, header,
-               os.path.join(output_dir, f'{id_part}_{args.method}_{args.components}component_muscle_seg.nii.gz'))
-    save_nifti(combined_mask, affine, header,
-               os.path.join(output_dir, f"{id_part}_{args.method}_{components}component_combined_seg.nii.gz"))
-    if components == 3:
-        save_nifti(total_undefined_image.astype(np.uint8), affine, header,
-                   os.path.join(output_dir, f'{id_part}_{args.method}_{args.components}component_undefined_seg.nii.gz'))
-    save_nifti(total_fat_image.astype(np.uint8), affine, header,
-               os.path.join(output_dir, f'{id_part}_{args.method}_{args.components}component_fat_seg.nii.gz'))
-
-    if args.method == 'gmm':
-        if components == 3:
-            component_names = ["muscle", "undefined", "fat"]
-        else:
-            component_names = ["muscle", "fat"]
-        for comp_idx, comp_name in enumerate(component_names):
-            out_path = os.path.join(
-                output_dir,
-                f"{id_part}_gmm_{comp_name}_{components}component_softseg.nii.gz"
-            )
-        save_nifti(total_probability_maps[comp_idx], affine, header, out_path)
-
-    return results_entry
-
-def results_entry_to_dataframe(results_entry: dict[int, dict]) -> pd.DataFrame:
-    rows = []
-    for lbl, entry in results_entry.items():
-        label_val = int(entry.get("Label", lbl))
-        row = {"Label": label_val}
-        row.update(entry)
-        rows.append(row)
-    df = pd.DataFrame(rows)
-    if "Label" in df.columns:
-        df = df.drop_duplicates(subset=["Label"]).sort_values("Label")   
-    return df
 
 def absolute_path(relative_path):
     base_path = os.path.dirname(__file__)  # Gets the directory where the script is located
@@ -1263,7 +1066,7 @@ class RemapLabels(MapTransform):
                 out[lab == orig] = tgt
             d[key] = out
         return d
-    
+
 class SqueezeTransform(MapTransform):
     def __init__(self, keys):
         super().__init__(keys)
@@ -1274,18 +1077,18 @@ class SqueezeTransform(MapTransform):
             out = lab.squeeze(0) if lab.dim() > 3 and lab.shape[0] == 1 else lab  # Remove channel dim if [1, H, W, D]
             d[key] = out
         return d
-    
+
 def connected_chunks(
     seg: np.ndarray,
-    labels: Optional[np.ndarray] = None,
+    labels: np.ndarray | None = None,
     connectivity: int = 1,  # 3=26-connectivity
 ) -> np.ndarray:
-    
+
     """
     Keeps only the largest connected component per label in a multi-label segmentation.
     - Supports both 3D (X,Y,Z) and 4D (1,X,Y,Z) arrays.
     - Incorporated to get optimize RAM memory management during inference for large images
-    - 
+    -
     """
     #Ensure that is nparray
     seg = np.asarray(seg)
@@ -1353,31 +1156,35 @@ def is_nifti(path: str) -> bool:
     p = path.lower()
     return p.endswith(".nii.gz") or p.endswith(".nii")
 
-def _make_out_path(image_path, output_dir, tag="_dseg"):
-    fname = os.path.basename(image_path)
+def _make_out_path(image_path: Path, output_dir: Path, tag="_dseg") -> Path:
+    fname = image_path.name
     if fname.endswith(".nii.gz"):
         base = fname[:-7]
     elif fname.endswith(".nii"):
         base = fname[:-4]
-    return os.path.join(output_dir, f"{base}{tag}.nii.gz")
+    else:
+        raise ValueError(f'image_path must end either in ".nii.gz" or ".nii", instead we got "{image_path}"')
+    return output_dir.joinpath(f"{base}{tag}.nii.gz")
+
+CUDA_DEVICE = torch.device('cuda')
 
 def run_inference(
     image_path,
-    output_dir,
+    output_dir: Path,
     pre_transforms,
     post_transforms,
     amp_context=None,
     chunk_size=25,
-    device=None,
+    device: torch.device = CUDA_DEVICE,
     inferer=None,
     model=None,
     out_channels=None,
     target_pixdim=None,
 ):
     out_path = _make_out_path(image_path, output_dir, "_dseg")
-    img_nii = nib.load(image_path)
+    img_nii: Nifti1Image = load(image_path)
     affine = img_nii.affine.copy()
-    header = img_nii.header.copy()
+    header = cast(Nifti1Header, img_nii.header).copy()
     dims = header.get_data_shape()
     D = dims[-1]
     auto_chunking = isinstance(chunk_size, str) and chunk_size.lower() == "auto"
@@ -1395,7 +1202,7 @@ def run_inference(
     chunk_size = max(1, min(chunk_size, D))
     logging.info("Using chunk size: %s%s", chunk_size, " (auto)" if auto_chunking else "")
 
-    temp_dir = os.path.join(output_dir, "temp_chunks")
+    temp_dir = output_dir.joinpath("temp_chunks")
     full_seg = None
     try:
         if chunk_size >= D:
@@ -1419,7 +1226,7 @@ def run_inference(
                 )
             else:
                 full_seg = connected_chunks(seg_np)
-                nib.save(nib.Nifti1Image(full_seg, affine, header), out_path)
+                save(Nifti1Image(full_seg, affine, header), out_path)
                 del seg_np
                 return out_path
 
@@ -1464,7 +1271,7 @@ def run_inference(
                     os.remove(chunk_path)
 
         full_seg = connected_chunks(full_seg)
-        nib.save(nib.Nifti1Image(full_seg, affine, header), out_path)
+        save(Nifti1Image(full_seg, affine, header), out_path)
         return out_path
     finally:
         del img_nii
