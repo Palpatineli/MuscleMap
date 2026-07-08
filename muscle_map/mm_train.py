@@ -31,7 +31,7 @@ from monai.transforms.spatial.dictionary import Orientationd, RandRotated, Spaci
 from monai.transforms.utility.dictionary import EnsureChannelFirstd, EnsureTyped
 from monai.utils import set_determinism
 
-from muscle_map.mm_util import DatasetParameter, DatasetStats, ModelConfig
+from muscle_map.mm_util import DatasetParameter, DatasetStats, JSONLoaderMixin, ModelConfig
 
 DATA_STATS_FILE = "data_stats.json"
 
@@ -132,7 +132,7 @@ def parse_args() -> ArgStats | ArgTrain:
     return OutClass(**args_dict)
 
 @dataclass
-class Sample:
+class Sample(JSONLoaderMixin):
     image: Path
     label: Path
     case_id: str
@@ -296,7 +296,8 @@ def main():
         train_cases = _discover_cases(Path(args.dataset_dir))
         logging.info(f"Discovered {len(train_cases)} training cases.", )
 
-        train_ds = Dataset(data=train_cases, transform=_make_transforms(config, orig_to_compact, training=True))
+        train_ds = Dataset(data=[x.to_dict() for x in train_cases],
+                           transform=_make_transforms(config, orig_to_compact, training=True))
 
         batch_size = args.batch_size or config.training.batch_size
         num_workers = args.num_workers if args.num_workers is not None else config.training.num_workers
@@ -312,7 +313,8 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logging.info(f"Training on {device}")
 
-        model = UNet(**config.architecture.to_dict()).to(device)
+        out_channels = len(labels) + 1
+        model = UNet(out_channels=out_channels, **config.architecture.to_dict()).to(device)
         learning_rate = args.learning_rate or float(config.training.learning_rate)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
                                       weight_decay=float(config.training.weight_decay))

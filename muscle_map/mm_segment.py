@@ -70,9 +70,6 @@ def get_parser() -> argparse.ArgumentParser:
     optional.add_argument("-m", '--model', default=None, required=False, type=str,
                           help="Option to specify another model.")
 
-    optional.add_argument("--model_version", default="latest", required=False, type=str,
-                          help="Model version to use, e.g. '1.3'. Default: latest available on Zenodo.")
-
     optional.add_argument("-s", '--overlap', required=False, default = 90, type=float,
                           help="Percent spatial overlap during sliding window inference, higher percent may improve accuracy but will reduce inference speed. Default is 90. If inference speed needs to be increased, the spatial overlap can be lowered. For large high-resolution or whole-body images, we recommend lowering the spatial inference to 50.")
 
@@ -121,8 +118,7 @@ def main() -> None:
     model_path, model_config_path = get_model_and_config_paths(args.region, args.model, args.model_version)
 
     model_config = ModelConfig.load_config(Path(model_config_path))
-    model_version = model_config.architecture.version
-    logging.info(f"Task: Segmentation  |  Region: {args.region.capitalize()}  |  Model version: {model_version}")
+    logging.info(f"Task: Segmentation  |  Region: {args.region.capitalize()}")
 
     norm_map = {
             "instance": Norm.INSTANCE,  # pyright: ignore[reportUnknownMemberType]

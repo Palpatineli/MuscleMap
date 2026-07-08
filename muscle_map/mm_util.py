@@ -51,7 +51,6 @@ class DatasetParameter(JSONLoaderMixin):
 @dataclass
 class ArchitectureConfig(JSONLoaderMixin):
     # minimal config for monai unet
-    version: str
     spatial_dims: Literal[2, 3]
     in_channels: int
     channels: list[int]
