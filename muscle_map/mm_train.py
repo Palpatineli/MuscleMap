@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from importlib.resources import files as import_files
 import logging
 import sys
+from tqdm import tqdm
 from pathlib import Path
 from typing import Hashable, cast, override
 from monai.metrics.metric import CumulativeIterationMetric
@@ -159,7 +160,7 @@ def _collect_dataset_stats(dataset_dir: Path) -> DatasetStats:
     cases = _discover_cases(dataset_dir)
     spacings: list[list[float]] = []
     sizes: list[list[int]] = []
-    for case in cases:
+    for case in tqdm(cases):
         img = load(case.image)
         sizes.append([int(v) for v in cast(Nifti1Header, img.header).get_data_shape()[:3]])
         spacings.append([float(v) for v in cast(Nifti1Header, img.header).get_zooms()[:3]])
@@ -319,7 +320,7 @@ def main():
         for epoch in range(1, args.epochs + 1):
             model.train()
             epoch_loss = 0.0
-            for batch in train_loader:
+            for batch in tqdm(train_loader):
                 images = batch["image"].to(device)
                 labels_t = batch["label"].to(device).long()
                 optimizer.zero_grad(set_to_none=True)
