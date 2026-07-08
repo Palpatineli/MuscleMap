@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from importlib.resources import files as import_files
 import logging
 import sys
+import json
 from tqdm import tqdm
 from pathlib import Path
 from typing import Hashable, cast, override
@@ -233,7 +234,7 @@ def _save_checkpoint(model: torch.nn.Module, config: ModelConfig, output_path: P
     pth_path = output_path.with_suffix(".pth")
     json_path = output_path.with_suffix(".json")
     torch.save(model.state_dict(), pth_path)
-    json_path.write_text(cast(str, config.to_json()))
+    json.dump(config.to_dict(), json_path.open('w', encoding='utf-8'), indent=4)
     return pth_path
 
 
@@ -268,12 +269,12 @@ def main():
     if isinstance(args, ArgStats):
         logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
         stats = _collect_dataset_stats(Path(args.dataset_dir))
-        if (output := Path(args.output)).is_dir():
-            output.mkdir(exist_ok=True)
+        if not (output := Path(args.output)).exists() or output.is_dir():
+            output.mkdir(exist_ok=True, parents=True)
             output /= DATA_STATS_FILE
         else:
             output.parent.mkdir(exist_ok=True)
-        output.write_text(cast(str, stats.to_json(indent=4)), 'utf-8')
+        json.dump(stats.to_dict(), output.open('w', encoding='utf-8'), indent=4)
         logging.info(f"Wrote dataset statistics to {args.output}.")
     else:
         result_dir = Path(args.result_dir)
@@ -283,7 +284,7 @@ def main():
         stats = DatasetStats.load_config(result_dir / DATA_STATS_FILE)  # pyright: ignore[reportUnknownMemberType]
         image_parameter = DatasetParameter.load_config(result_dir / "dataset_parameter.json")  # pyright: ignore[reportUnknownMemberType]
         config = _build_config(image_parameter, stats)
-        result_dir.joinpath("training_config.json").write_text(cast(str, config.to_json()))
+        json.dump(config.to_dict(), result_dir.joinpath("training_config.json").open('w', encoding='utf-8'), indent=4)
         seed = args.seed or config.training.seed
         set_determinism(seed=seed)
 
