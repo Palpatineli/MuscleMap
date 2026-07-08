@@ -49,7 +49,7 @@ class DatasetParameter(JSONLoaderMixin):
     file_ending: str
 
 @dataclass
-class ArchitectureConfig:
+class ArchitectureConfig(JSONLoaderMixin):
     # minimal config for monai unet
     version: str
     spatial_dims: Literal[2, 3]
@@ -468,7 +468,7 @@ def get_template_paths(region, specified_template=None):
 
 def load_model_config(config_path: Path) -> ModelConfig:
     try:
-        return ModelConfig.load_config(config_path)
+        return ModelConfig.load_config(config_path)  # pyright: ignore[reportUnknownMemberType]
     except FileNotFoundError:
         logging.error(f"Error: The configuration file '{config_path}' was not found.")
         sys.exit(1)
@@ -517,7 +517,7 @@ def _resolve_target_spacing(header_zooms, target_pixdim):
     if not target_pixdim:
         return tuple(float(z) for z in header_zooms[:3])
 
-    resolved = []
+    resolved: list[float] = []
     for axis, zoom in enumerate(header_zooms[:3]):
         try:
             target = float(target_pixdim[axis])
@@ -546,7 +546,7 @@ def _read_int_file(path: Path, allow_zero=False):
 
 def _get_cgroup_memory_budget():
     proc_cgroup = Path("/proc/self/cgroup")
-    candidates = []
+    candidates: list[tuple[Path, Path]] = []
 
     if proc_cgroup.exists():
         try:
@@ -593,7 +593,7 @@ def _get_cgroup_memory_budget():
         ]
     )
 
-    seen = set()
+    seen: set[tuple[str, str]] = set()
     for limit_path, current_path in candidates:
         key = (str(limit_path), str(current_path))
         if key in seen:
@@ -736,7 +736,7 @@ def _run_inference_on_file(
     amp_context,
     device: torch.device,
     inferer,
-    model,
+    model: torch.nn.Module,
 ):
     data = None
     tensor = None
@@ -1173,11 +1173,11 @@ def run_inference(
     output_dir: Path,
     pre_transforms,
     post_transforms,
+    model: torch.nn.Module,
     amp_context=None,
     chunk_size=25,
     device: torch.device = CUDA_DEVICE,
     inferer=None,
-    model=None,
     out_channels=None,
     target_pixdim=None,
 ):

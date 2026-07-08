@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 import argparse
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from importlib.resources import files as import_files
-import json
 import logging
 import sys
 from pathlib import Path
@@ -169,7 +168,7 @@ def _collect_dataset_stats(dataset_dir: Path) -> DatasetStats:
 
 def _build_config(data_param: DatasetParameter, datastat: DatasetStats) -> ModelConfig:
     default_config_file = import_files("muscle_map") / "model_config_default.json"
-    config = ModelConfig.load_config(default_config_file, dataset=asdict(data_param))  # pyright: ignore[reportUnknownMemberType]
+    config = ModelConfig.load_config(default_config_file, dataset=data_param.to_dict())  # pyright: ignore[reportUnknownMemberType]
     config.architecture.in_channels = len(data_param.channel_names)
     config.image.spacing = tuple(np.median(np.array(datastat.spacings), axis=0))
     return config
@@ -273,7 +272,7 @@ def main():
             output /= DATA_STATS_FILE
         else:
             output.parent.mkdir(exist_ok=True)
-        output.write_text(json.dumps(asdict(stats), indent=2), 'utf-8')
+        output.write_text(cast(str, stats.to_json(indent=4)), 'utf-8')
         logging.info(f"Wrote dataset statistics to {args.output}.")
     else:
         result_dir = Path(args.result_dir)
@@ -311,7 +310,7 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logging.info(f"Training on {device}")
 
-        model = UNet(**asdict(config.architecture)).to(device)
+        model = UNet(**config.architecture.to_dict()).to(device)
         learning_rate = args.learning_rate or float(config.training.learning_rate)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
                                       weight_decay=float(config.training.weight_decay))
