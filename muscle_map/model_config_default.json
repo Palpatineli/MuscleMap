@@ -21,7 +21,8 @@
     "samples_per_volume": 4,
     "num_workers": 4,
     "seed": 2026,
-    "rotation_degrees": 15
+    "rotation_degrees": 15,
+    "verify_nifti_files": true
   },
   "dataset": {
     "description": " Segmentation",

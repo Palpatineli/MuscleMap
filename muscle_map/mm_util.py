@@ -75,6 +75,7 @@ class TrainParameter:
     weight_decay: float = field(default=1E-5)
     seed: int = field(default=2026)
     rotation_degrees: int = field(default=15)
+    verify_nifti_files: bool = field(default=True)
 
 @dataclass
 class ModelConfig(JSONLoaderMixin):

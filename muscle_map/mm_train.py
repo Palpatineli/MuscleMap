@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 import argparse
 from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import dataclass
+from gzip import BadGzipFile
+from gzip import open as gzip_open
 from importlib.resources import files as import_files
 import logging
 import sys
@@ -11,6 +14,7 @@ from pathlib import Path
 from typing import Hashable, cast, override
 from monai.metrics.metric import CumulativeIterationMetric
 from nibabel import load, Nifti1Header
+from nibabel.filebasedimages import ImageFileError
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -168,6 +172,31 @@ def _collect_dataset_stats(dataset_dir: Path) -> DatasetStats:
         del img
     return DatasetStats(dataset_dir=Path(dataset_dir).resolve(), num_cases=len(cases), spacings=spacings, sizes=sizes)
 
+def _verify_nifti_file(path: Path) -> None:
+    """Force a NIfTI payload read so truncated compressed files fail before training."""
+    try:
+        img = load(path)
+        if path.name.endswith(".gz"):
+            with gzip_open(path, "rb") as f:
+                while f.read(1024 * 1024):
+                    pass
+        else:
+            data = np.asanyarray(img.dataobj, order="C")
+            del data
+    except (BadGzipFile, EOFError, ImageFileError, OSError, RuntimeError) as exc:
+        raise RuntimeError(f"Unreadable NIfTI file '{path}': {exc}") from exc
+    finally:
+        if "img" in locals():
+            del img
+
+def _verify_training_cases(cases: Sequence[Sample]) -> None:
+    for case in tqdm(cases, desc="Verifying NIfTI files"):
+        try:
+            _verify_nifti_file(case.image)
+            _verify_nifti_file(case.label)
+        except RuntimeError as exc:
+            raise RuntimeError(f"Invalid training case '{case.case_id}'. {exc}") from exc
+
 def _build_config(data_param: DatasetParameter, datastat: DatasetStats) -> ModelConfig:
     default_config_file = import_files("muscle_map") / "model_config_default.json"
     config = ModelConfig.load_config(default_config_file, dataset=data_param.to_dict())  # pyright: ignore[reportUnknownMemberType]
@@ -295,6 +324,9 @@ def main():
 
         train_cases = _discover_cases(Path(args.dataset_dir))
         logging.info(f"Discovered {len(train_cases)} training cases.", )
+        if config.training.verify_nifti_files:
+            logging.info("Verifying NIfTI image and label files before training.")
+            _verify_training_cases(train_cases)
 
         train_ds = Dataset(data=[x.to_dict() for x in train_cases],
                            transform=_make_transforms(config, orig_to_compact, training=True))
