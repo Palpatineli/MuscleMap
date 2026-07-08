@@ -7,7 +7,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Hashable, cast, override
+from typing import Hashable, cast, override
 from monai.metrics.metric import CumulativeIterationMetric
 from nibabel import load, Nifti1Header
 import numpy as np
@@ -174,11 +174,6 @@ def _build_config(data_param: DatasetParameter, datastat: DatasetStats) -> Model
     config.image.spacing = tuple(np.median(np.array(datastat.spacings), axis=0))
     return config
 
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    with path.open("w") as f:
-        json.dump(payload, f, indent=2)
-        f.write("\n")
-
 def _make_transforms(config: ModelConfig, orig_to_compact: dict[int, int], training: bool = True) -> Compose:
     spacing = config.image.spacing
     patch_size = config.image.train_patch_size
@@ -238,7 +233,7 @@ def _save_checkpoint(model: torch.nn.Module, config: ModelConfig, output_path: P
     pth_path = output_path.with_suffix(".pth")
     json_path = output_path.with_suffix(".json")
     torch.save(model.state_dict(), pth_path)
-    _write_json(json_path, asdict(config))
+    json_path.write_text(cast(str, config.to_json()))
     return pth_path
 
 
@@ -288,7 +283,7 @@ def main():
         stats = DatasetStats.load_config(result_dir / DATA_STATS_FILE)  # pyright: ignore[reportUnknownMemberType]
         image_parameter = DatasetParameter.load_config(result_dir / "dataset_parameter.json")  # pyright: ignore[reportUnknownMemberType]
         config = _build_config(image_parameter, stats)
-        _write_json(result_dir / "training_config.json", asdict(config))
+        result_dir.joinpath("training_config.json").write_text(cast(str, config.to_json()))
         seed = args.seed or config.training.seed
         set_determinism(seed=seed)
 
