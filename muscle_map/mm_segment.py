@@ -1,13 +1,12 @@
 #!/usr/bin/env python
-from ntpath import exists
 from pathlib import Path
 import warnings
 import argparse
 import logging
-import os
 import gc
 from contextlib import nullcontext
 import sys
+from typing import cast
 from monai.inferers.inferer import SliceInferer, SlidingWindowInferer
 from monai.networks.nets.unet import UNet
 from monai.transforms.post.dictionary import AsDiscreted, Invertd
@@ -102,8 +101,8 @@ def main() -> None:
     else:
         logging.info("Processing on a CPU will slow down inference speed")
 
-    if (output := Path.cwd() if (output := args.output_dir) is None else Path(output).absolute()):
-        output.parent.mkdir(exist_ok=True)
+    output = Path.cwd() if args.output_dir is None else Path(args.output_dir).absolute()
+    output.mkdir(parents=True, exist_ok=True)
 
     image_paths = [image.strip() for image in args.input_image.split(',')]
     for image_path in image_paths:
@@ -115,7 +114,7 @@ def main() -> None:
 
     logging.info("Loading configuration file...")
 
-    model_path, model_config_path = get_model_and_config_paths(args.region, args.model, args.model_version)
+    model_path, model_config_path = get_model_and_config_paths(args.region, args.model)
 
     model_config = ModelConfig.load_config(Path(model_config_path))
     logging.info(f"Task: Segmentation  |  Region: {args.region.capitalize()}")
@@ -123,14 +122,13 @@ def main() -> None:
     norm_map = {
             "instance": Norm.INSTANCE,  # pyright: ignore[reportUnknownMemberType]
             }
-    # TODO: find a place for data fingerprint, and to calculate pix_dim, should use _resolve_pix_dim
-    pix_dim = tuple(model_config['parameters']['pix_dim'])
+    pix_dim = model_config.image.spacing
     spatial_dims = model_config.architecture.spatial_dims
-    out_channels = len(model_config.dataset.labels) - 1
+    out_channels = len(set(model_config.dataset.labels.values()))
 
-    labels = sorted(list(model_config.dataset.labels.values()))
+    labels = sorted(set(model_config.dataset.labels.values()))
     id_map = {0: 0}
-    for new_id, orig in enumerate(labels, start=1):
+    for new_id, orig in enumerate((label for label in labels if label > 0), start=1):
         id_map[orig] = new_id
     inv_id_map = {new_id: orig for orig, new_id in id_map.items()}
 
@@ -148,7 +146,7 @@ def main() -> None:
         LoadImaged(keys=["image"], image_only=False),
         EnsureChannelFirstd(keys=["image"]),
         Orientationd(keys=["image"], axcodes="RAS"),
-        Spacingd(keys=["image"], pixdim=model_config.dataset.pix_dim, mode="bilinear"),
+        Spacingd(keys=["image"], pixdim=pix_dim, mode="bilinear"),
         NormalizeIntensityd(keys=["image"], nonzero=True),
         CropForegroundd(keys=["image"], source_key="image", margin=20),
         SpatialPadd(
@@ -193,6 +191,9 @@ def main() -> None:
     gc.collect()
     model = model.to(device)
     model.eval()
+    if device.type == "cuda":
+        # GPU inference follows the same compiled execution policy as training.
+        model = cast(torch.nn.Module, torch.compile(model, dynamic=False))  # pyright: ignore[reportUnknownMemberType]
 
     overlap_inference = args.overlap / 100
     if spatial_dims == 2:
@@ -216,18 +217,18 @@ def main() -> None:
         t0 = perf_counter()
         try:
             run_inference(
-                    test["image"],
-                    output,
-                    pre_transforms,
-                    post_transforms,
-                    amp_context,
-                    chunk_size,
-                    device,
-                    inferer,
-                    model,
-                    out_channels=out_channels,
-                    target_pixdim=pix_dim,
-                    )
+                image_path=Path(test["image"]),
+                output_dir=output,
+                pre_transforms=pre_transforms,
+                post_transforms=post_transforms,
+                model=model,
+                amp_context=amp_context,
+                chunk_size=chunk_size,
+                device=device,
+                inferer=inferer,
+                out_channels=out_channels,
+                target_pixdim=pix_dim,
+            )
             logging.info(f"Inference of {test} finished in {perf_counter()-t0:.2f}s")
         except Exception as e:
             logging.exception(f"Error processing {test['image']}: {e}")
