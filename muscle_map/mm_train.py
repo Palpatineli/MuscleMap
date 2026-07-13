@@ -22,7 +22,7 @@ import random
 import sys
 from typing import Any, Hashable, Literal, cast, override
 
-from monai.data import DataLoader, list_data_collate
+from monai.data import DataLoader, MetaTensor, list_data_collate
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
 from monai.metrics.metric import CumulativeIterationMetric
@@ -792,6 +792,11 @@ def _autocast_context(amp_mode: AmpMode):
     return torch.autocast(device_type="cuda", dtype=dtype)
 
 
+def _plain_tensor(value: torch.Tensor) -> torch.Tensor:
+    """Remove MONAI metadata before a tensor enters a compiled model."""
+    return value.as_tensor() if isinstance(value, MetaTensor) else value
+
+
 def _calibration_step(
     dataset: CachedTrainingDataset,
     volume_batch_size: int,
@@ -819,8 +824,8 @@ def _calibration_step(
         model = cast(torch.nn.Module, torch.compile(eager_model, dynamic=False))  # pyright: ignore[reportUnknownMemberType]
         scaler = torch.amp.GradScaler("cuda", enabled=amp_mode == "fp16")
         loss_fn = DiceCELoss(to_onehot_y=True, softmax=True)
-        images = batch["image"].to(device, non_blocking=True)
-        labels = batch["label"].to(device, non_blocking=True).long()
+        images = _plain_tensor(batch["image"]).to(device, non_blocking=True)
+        labels = _plain_tensor(batch["label"]).to(device, non_blocking=True).long()
         torch.cuda.reset_peak_memory_stats(device)
         optimizer.zero_grad(set_to_none=True)
         with _autocast_context(amp_mode):
@@ -1002,8 +1007,8 @@ def _run_validation(
     validation_loss = 0.0
     with torch.inference_mode():
         for batch in loader:
-            images = batch["image"].to(device, non_blocking=True)
-            labels = batch["label"].to(device, non_blocking=True).long()
+            images = _plain_tensor(batch["image"]).to(device, non_blocking=True)
+            labels = _plain_tensor(batch["label"]).to(device, non_blocking=True).long()
             with _autocast_context(amp_mode):
                 logits = model(images)
                 validation_loss += loss_fn(logits, labels).item()
@@ -1121,8 +1126,8 @@ def _run_training(args: ArgTrain) -> None:
         model.train()
         epoch_loss = 0.0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"):
-            images = batch["image"].to(device, non_blocking=True)
-            labels_tensor = batch["label"].to(device, non_blocking=True).long()
+            images = _plain_tensor(batch["image"]).to(device, non_blocking=True)
+            labels_tensor = _plain_tensor(batch["label"]).to(device, non_blocking=True).long()
             optimizer.zero_grad(set_to_none=True)
             with _autocast_context(args.amp):
                 logits = model(images)

@@ -14,6 +14,7 @@ import numpy.typing as npt
 from nibabel import save, load, Nifti1Header, Nifti1Image
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
+from monai.data import MetaTensor
 from monai.transforms.transform import MapTransform
 import gc
 import torch
@@ -749,6 +750,8 @@ def _run_inference_on_file(
         data = {"image": image_path}
         data = pre_transforms(data)
         tensor = data["image"]
+        if isinstance(tensor, MetaTensor):
+            tensor = tensor.as_tensor()
         if device.type == "cpu":
             tensor = tensor.float()
         if tensor.ndim == 4:
