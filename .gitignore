@@ -3,7 +3,7 @@ __pycache__/
 **/__pycache__/
 *.egg-info/
 
-models/*/
+muscle_map/models/*/
 
 *.pth
 *.nii.gz
