@@ -42,6 +42,7 @@ Homepage = "https://github.com/Palpatineli/MuscleMap.git"
 [project.scripts]
 mm_segment = "muscle_map.mm_segment:main"
 mm_train = "muscle_map.mm_train:main"
+mm_convert_model_config = "muscle_map.mm_convert_model_config:main"
 mm_extract_metrics = "muscle_map.mm_extract_metrics:main"
 mm_gui = "muscle_map.mm_gui:main"
 mm_register_to_template = "muscle_map.mm_register_to_template:main"

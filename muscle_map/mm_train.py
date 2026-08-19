@@ -1055,6 +1055,7 @@ def _run_training(args: ArgTrain) -> None:
     dataset_stats = DatasetStats.load_config(result_dir / DATA_STATS_FILE)  # pyright: ignore[reportUnknownMemberType]
     dataset_parameter = DatasetParameter.load_config(result_dir / "dataset_parameter.json")  # pyright: ignore[reportUnknownMemberType]
     config = _build_config(dataset_parameter, dataset_stats, args.spacing)
+    config.require_trainable()
     _write_json(result_dir / "training_config.json", config.to_dict())
 
     seed = args.seed if args.seed is not None else config.training.seed

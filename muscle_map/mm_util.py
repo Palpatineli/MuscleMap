@@ -1,10 +1,14 @@
-from importlib.abc import Traversable
+from importlib.resources.abc import Traversable
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal, NotRequired, Self, TypedDict, cast
+import colorsys
+from copy import deepcopy
 import os
 import logging
 import sys
 import json
 import math
+import re
 from dataclasses import dataclass, field
 import hashlib
 import tempfile
@@ -84,6 +88,68 @@ class ModelConfig(JSONLoaderMixin):
     image: ImageParameter
     training: TrainParameter
     dataset: DatasetParameter
+    training_compatible: bool = True
+    missing_training_fields: list[str] = field(default_factory=list)
+
+    @classmethod
+    def load_config(cls, json_path: Path | Traversable, **kwargs: Any) -> Self:
+        """Load metadata while retaining inference support for null legacy training fields."""
+        with json_path.open() as file:
+            data = json.load(file)
+        for key, value in kwargs.items():
+            data[key] = value
+        normalized = deepcopy(data)
+        replacements = {
+            "image": {"train_patch_size": []},
+            "training": {
+                "batch_size": 0,
+                "samples_per_volume": 0,
+                "num_workers": 0,
+                "learning_rate": 0.0,
+                "weight_decay": 0.0,
+                "seed": 0,
+                "rotation_degrees": 0,
+                "verify_nifti_files": False,
+            },
+            "dataset": {
+                "description": "",
+                "name": "",
+                "numTraining": 0,
+                "reference": "",
+                "release": "",
+                "channel_names": {},
+                "file_ending": "",
+            },
+        }
+        for section, fields in replacements.items():
+            values = normalized.get(section)
+            if not isinstance(values, dict):
+                continue
+            for field_name, replacement in fields.items():
+                if values.get(field_name) is None:
+                    values[field_name] = replacement
+        return cls.from_dict(normalized)  # pyright: ignore[reportUnknownMemberType]
+
+    def require_trainable(self) -> None:
+        """Reject metadata that lacks settings required to start or continue training."""
+        missing = list(self.missing_training_fields)
+        required_values = {
+            "image.train_patch_size": self.image.train_patch_size,
+            "training.batch_size": self.training.batch_size,
+            "training.samples_per_volume": self.training.samples_per_volume,
+            "training.num_workers": self.training.num_workers,
+            "training.learning_rate": self.training.learning_rate,
+            "training.weight_decay": self.training.weight_decay,
+            "training.seed": self.training.seed,
+            "training.rotation_degrees": self.training.rotation_degrees,
+            "training.verify_nifti_files": self.training.verify_nifti_files,
+            "dataset.channel_names": self.dataset.channel_names,
+            "dataset.file_ending": self.dataset.file_ending,
+        }
+        missing.extend(name for name, value in required_values.items() if value is None)
+        if not self.training_compatible or missing:
+            fields = ", ".join(sorted(set(missing)))
+            raise ValueError(f"Model metadata is inference-only and cannot be trained or fine-tuned: {fields}.")
 
 @dataclass
 class DatasetStats(JSONLoaderMixin):
@@ -731,7 +797,7 @@ def estimate_auto_chunk_size(image_path, device: torch.device | None, out_channe
     return estimated_chunk
 
 def _run_inference_on_file(
-    image_path: Path,
+    image_paths: Sequence[Path],
     pre_transforms,
     post_transforms,
     amp_context,
@@ -747,7 +813,7 @@ def _run_inference_on_file(
     post_out = None
     seg_tensor = None
     try:
-        data = {"image": image_path}
+        data = {"image": image_paths[0] if len(image_paths) == 1 else list(image_paths)}
         data = pre_transforms(data)
         tensor = data["image"]
         if isinstance(tensor, MetaTensor):
@@ -760,6 +826,13 @@ def _run_inference_on_file(
 
         with amp_context, torch.inference_mode():
             pred = inferer(tensor, model)
+
+        if isinstance(data["image"], MetaTensor) and not isinstance(pred, MetaTensor):
+            pred = MetaTensor(
+                pred,
+                meta=deepcopy(data["image"].meta),
+                applied_operations=deepcopy(data["image"].applied_operations),
+            )
 
         single_pred = pred.squeeze(0).squeeze(0)
         del pred
@@ -776,9 +849,9 @@ def _run_inference_on_file(
         del data, tensor, pred, single_pred, post_in, post_out, seg_tensor
         _release_memory(device)
 
-def _write_temp_chunk(image_proxy, affine, header, temp_dir: Path, start, end):
+def _write_temp_chunk(image_proxy, affine, header, temp_dir: Path, start: int, end: int, channel: int) -> Path:
     vol_chunk = np.asarray(image_proxy.dataobj[..., start:end], dtype=np.float32)
-    chunk_path = temp_dir.joinpath(f"chunk_{start}_{end}.nii")
+    chunk_path = temp_dir.joinpath(f"chunk_{channel:04d}_{start}_{end}.nii")
     save(Nifti1Image(vol_chunk, affine, header.copy()), chunk_path)
     del vol_chunk
     return chunk_path
@@ -1159,20 +1232,63 @@ def is_nifti(path: str) -> bool:
     p = path.lower()
     return p.endswith(".nii.gz") or p.endswith(".nii")
 
-def _make_out_path(image_path: Path, output_dir: Path, tag="_dseg") -> Path:
+_CHANNEL_SUFFIX = re.compile(r"^(?P<case>.+)_\d{4}$")
+
+
+def _nifti_stem(image_path: Path) -> str:
     fname = image_path.name
     if fname.endswith(".nii.gz"):
-        base = fname[:-7]
+        return fname[:-7]
     elif fname.endswith(".nii"):
-        base = fname[:-4]
-    else:
-        raise ValueError(f'image_path must end either in ".nii.gz" or ".nii", instead we got "{image_path}"')
-    return output_dir.joinpath(f"{base}{tag}.nii.gz")
+        return fname[:-4]
+    raise ValueError(f'image_path must end either in ".nii.gz" or ".nii", instead we got "{image_path}"')
+
+
+def prediction_path(image_path: Path, output_dir: Path) -> Path:
+    """Return the segmentation path, honoring nnU-Net-style channel suffixes."""
+    base = _nifti_stem(image_path)
+    channel_match = _CHANNEL_SUFFIX.fullmatch(base)
+    if channel_match:
+        return output_dir / f"{channel_match.group('case')}.nii.gz"
+    return output_dir / f"{base}_dseg.nii.gz"
+
+
+def color_table_path(segmentation_path: Path) -> Path:
+    """Return the 3D Slicer color-table companion path for a segmentation."""
+    return segmentation_path.with_name(f"{_nifti_stem(segmentation_path)}.ctbl")
+
+
+def _write_color_table(segmentation_path: Path, labels: Mapping[str, int]) -> Path:
+    """Write a deterministic 3D Slicer color table for one label NIfTI."""
+    labels_by_value = {int(value): name for name, value in labels.items()}
+    lines = ["# Color table file generated by MuscleMap", "0 Background 0 0 0 0"]
+    for index, value in enumerate(sorted(label for label in labels_by_value if label > 0), start=1):
+        red, green, blue = (
+            round(component * 255)
+            for component in colorsys.hsv_to_rgb((index * 0.61803398875) % 1, 0.65, 0.95)
+        )
+        name = re.sub(r"\s+", "_", labels_by_value[value])
+        lines.append(f"{value} {name} {red} {green} {blue} 255")
+    path = color_table_path(segmentation_path)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    return path
+
+
+def _save_prediction(
+    segmentation: np.ndarray,
+    affine: npt.NDArray[np.float32],
+    header: Nifti1Header,
+    output_path: Path,
+    labels: Mapping[str, int] | None,
+) -> None:
+    save(Nifti1Image(segmentation, affine, header), output_path)
+    if labels is not None:
+        _write_color_table(output_path, labels)
 
 CUDA_DEVICE = torch.device('cuda')
 
 def run_inference(
-    image_path,
+    image_path: Path | Sequence[Path],
     output_dir: Path,
     pre_transforms,
     post_transforms,
@@ -1183,18 +1299,27 @@ def run_inference(
     inferer=None,
     out_channels=None,
     target_pixdim=None,
+    labels: Mapping[str, int] | None = None,
 ):
-    out_path = _make_out_path(image_path, output_dir, "_dseg")
-    img_nii: Nifti1Image = load(image_path)
+    image_paths = (Path(image_path),) if isinstance(image_path, (str, Path)) else tuple(Path(path) for path in image_path)
+    if not image_paths:
+        raise ValueError("At least one input image is required for inference.")
+    out_path = prediction_path(image_paths[0], output_dir)
+    image_niis: list[Nifti1Image] = [cast(Nifti1Image, load(path)) for path in image_paths]
+    img_nii: Nifti1Image = image_niis[0]
     affine = img_nii.affine.copy()
     header = cast(Nifti1Header, img_nii.header).copy()
     dims = header.get_data_shape()
+    for path, image_nii in zip(image_paths[1:], image_niis[1:]):
+        channel_header = cast(Nifti1Header, image_nii.header)
+        if channel_header.get_data_shape() != dims or not np.allclose(image_nii.affine, affine):
+            raise ValueError(f"Input channel '{path}' does not share the first channel's shape and affine.")
     D = dims[-1]
     auto_chunking = isinstance(chunk_size, str) and chunk_size.lower() == "auto"
 
     if auto_chunking:
         chunk_size = estimate_auto_chunk_size(
-            image_path,
+            image_paths[0],
             device,
             out_channels=out_channels,
             target_pixdim=target_pixdim,
@@ -1211,7 +1336,7 @@ def run_inference(
         if chunk_size >= D:
             try:
                 seg_np = _run_inference_on_file(
-                    image_path,
+                    image_paths,
                     pre_transforms,
                     post_transforms,
                     amp_context,
@@ -1229,7 +1354,7 @@ def run_inference(
                 )
             else:
                 full_seg = connected_chunks(seg_np)
-                save(Nifti1Image(full_seg, affine, header), out_path)
+                _save_prediction(full_seg, affine, header, out_path, labels)
                 del seg_np
                 return out_path
 
@@ -1238,11 +1363,14 @@ def run_inference(
         start = 0
         while start < D:
             end = min(start + chunk_size, D)
-            chunk_path = None
+            chunk_paths: list[Path] = []
             try:
-                chunk_path = _write_temp_chunk(img_nii, affine, header, temp_dir, start, end)
+                chunk_paths = [
+                    _write_temp_chunk(image_nii, affine, header, temp_dir, start, end, channel)
+                    for channel, image_nii in enumerate(image_niis)
+                ]
                 seg_np = _run_inference_on_file(
-                    chunk_path,
+                    chunk_paths,
                     pre_transforms,
                     post_transforms,
                     amp_context,
@@ -1270,14 +1398,15 @@ def run_inference(
                 )
                 chunk_size = new_chunk_size
             finally:
-                if chunk_path and os.path.exists(chunk_path):
-                    os.remove(chunk_path)
+                for chunk_path in chunk_paths:
+                    if chunk_path.exists():
+                        chunk_path.unlink()
 
         full_seg = connected_chunks(full_seg)
-        save(Nifti1Image(full_seg, affine, header), out_path)
+        _save_prediction(full_seg, affine, header, out_path, labels)
         return out_path
     finally:
-        del img_nii
+        del image_niis
         if full_seg is not None:
             del full_seg
         _release_memory(device)

@@ -2,9 +2,11 @@
 from pathlib import Path
 import warnings
 import argparse
+from dataclasses import dataclass
 import logging
 import gc
 from contextlib import nullcontext
+import re
 import sys
 from typing import cast
 from monai.inferers.inferer import SliceInferer, SlidingWindowInferer
@@ -25,14 +27,25 @@ from muscle_map.mm_util import (
     ModelConfig,
     RemapLabels,
     SqueezeTransform,
-    check_image_exists,
+    color_table_path,
     get_model_and_config_paths,
     is_nifti,
+    prediction_path,
     run_inference,
 )
 
 warnings.filterwarnings("ignore")
 print("Command line arguments received:", sys.argv)
+
+_CHANNEL_SUFFIX = re.compile(r"^(?P<case>.+)_(?P<channel>\d{4})$")
+
+
+@dataclass(frozen=True)
+class InferenceCase:
+    """One logical inference case, represented by one or more image channels."""
+
+    image_paths: tuple[Path, ...]
+    output_path: Path
 
 def chunk_size_arg(value: str) -> int | str:
     """Parse a positive chunk size or the special value 'auto'."""
@@ -46,8 +59,80 @@ def chunk_size_arg(value: str) -> int | str:
         raise argparse.ArgumentTypeError("chunk_size must be at least 1.")
     return parsed
 
-#naming not functional
-# get_parser: parses command line arguments, sets up a) required (image, body region), and b) optional arguments (model, output file name, output directory)
+
+def _nifti_stem(path: Path) -> str:
+    if path.name.endswith(".nii.gz"):
+        return path.name[:-7]
+    if path.name.endswith(".nii"):
+        return path.name[:-4]
+    raise ValueError(f"Input '{path}' is not a NIfTI image.")
+
+
+def _expand_input_paths(input_spec: str) -> list[Path]:
+    """Expand file and directory CLI arguments into individual NIfTI paths."""
+    image_paths: list[Path] = []
+    for raw_path in input_spec.split(","):
+        path = Path(raw_path.strip()).expanduser()
+        if not raw_path.strip():
+            raise ValueError("Input paths cannot be empty.")
+        if path.is_dir():
+            folder_images = sorted(
+                (candidate.resolve() for candidate in path.iterdir()
+                 if candidate.is_file() and candidate.name.endswith(".nii.gz")),
+                key=lambda candidate: candidate.name,
+            )
+            if not folder_images:
+                raise ValueError(f"Input directory '{path}' contains no .nii.gz files.")
+            image_paths.extend(folder_images)
+            continue
+        if not path.is_file():
+            raise FileNotFoundError(f"Input image '{path}' does not exist or is not a file.")
+        if not is_nifti(str(path)):
+            raise ValueError(f"Input '{path}' is not a valid NIfTI (.nii or .nii.gz).")
+        image_paths.append(path.resolve())
+    if len(set(image_paths)) != len(image_paths):
+        raise ValueError("The same input image was supplied more than once.")
+    return image_paths
+
+
+def _build_inference_cases(
+    input_spec: str,
+    output_dir: Path,
+    in_channels: int,
+    overwrite: bool,
+) -> list[InferenceCase]:
+    """Group channel-suffixed files and reject ambiguous or unsafe outputs."""
+    grouped: dict[tuple[Path, str], dict[int, Path]] = {}
+    for path in _expand_input_paths(input_spec):
+        stem = _nifti_stem(path)
+        match = _CHANNEL_SUFFIX.fullmatch(stem)
+        case_name = match.group("case") if match else stem
+        channel = int(match.group("channel")) if match else 0
+        channels = grouped.setdefault((path.parent, case_name), {})
+        if channel in channels:
+            raise ValueError(f"Case '{case_name}' has more than one channel {channel:04d}.")
+        channels[channel] = path
+
+    cases: list[InferenceCase] = []
+    outputs: set[Path] = set()
+    for (_, case_name), channel_map in grouped.items():
+        channel_ids = sorted(channel_map)
+        if channel_ids != list(range(len(channel_ids))):
+            raise ValueError(f"Case '{case_name}' channels must start at _0000 and be contiguous.")
+        if len(channel_ids) != in_channels:
+            raise ValueError(
+                f"Case '{case_name}' has {len(channel_ids)} input channel(s), but the model requires {in_channels}."
+            )
+        image_paths = tuple(channel_map[channel] for channel in channel_ids)
+        output_path = prediction_path(image_paths[0], output_dir)
+        if output_path in outputs:
+            raise ValueError(f"Multiple cases would write '{output_path}'.")
+        outputs.add(output_path)
+        if not overwrite and (output_path.exists() or color_table_path(output_path).exists()):
+            raise FileExistsError(f"Output already exists: '{output_path}'. Use --overwrite to replace it.")
+        cases.append(InferenceCase(image_paths=image_paths, output_path=output_path))
+    return cases
+
 def get_parser() -> argparse.ArgumentParser:
     """Build the command-line parser for segmentation inference."""
     parser = argparse.ArgumentParser(
@@ -57,14 +142,17 @@ def get_parser() -> argparse.ArgumentParser:
     required = parser.add_argument_group("Required")
 
     required.add_argument("-i", '--input_image', required=True, type=str,
-                          help="Input image to segment. Can be single image or list of images separated by commas.")
+                          help="Input image, folder of .nii.gz images, or a comma-separated mix of both.")
 
     required.add_argument("-r", '--region', required=False, default = 'wholebody', type=str,
                           help="Anatomical region to segment. Supported regions: wholebody, abdomen, pelvis, thigh, and leg. Default is wholebody.")
     # Optional arguments
     optional = parser.add_argument_group("Optional")
-    required.add_argument("-o", '--output_dir', required=False, type=str,
-                          help="Output directory to save the results, output file name suffix = dseg. If left empty, saves to current working directory.")
+    optional.add_argument("-o", '--output_dir', required=False, type=str,
+                          help="Output directory. Channel-suffixed inputs such as case_0000.nii.gz produce case.nii.gz; other inputs produce *_dseg.nii.gz.")
+
+    optional.add_argument("--overwrite", action="store_true",
+                          help="Replace existing segmentation and color-table outputs.")
 
     optional.add_argument("-m", '--model', default=None, required=False, type=str,
                           help="Option to specify another model.")
@@ -104,20 +192,24 @@ def main() -> None:
     output = Path.cwd() if args.output_dir is None else Path(args.output_dir).absolute()
     output.mkdir(parents=True, exist_ok=True)
 
-    image_paths = [image.strip() for image in args.input_image.split(',')]
-    for image_path in image_paths:
-        logging.info(f"Checking if image '{image_path}' exists and is readable...")
-        check_image_exists(image_path)
-        if not is_nifti(image_path):
-            logging.error(f"Error: {image_path} is not a valid NIfTI (.nii or .nii.gz)")
-            sys.exit(1) 
-
     logging.info("Loading configuration file...")
 
     model_path, model_config_path = get_model_and_config_paths(args.region, args.model)
 
     model_config = ModelConfig.load_config(Path(model_config_path))
     logging.info(f"Task: Segmentation  |  Region: {args.region.capitalize()}")
+
+    try:
+        test_cases = _build_inference_cases(
+            args.input_image,
+            output,
+            model_config.architecture.in_channels,
+            args.overwrite,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        logging.error("Input validation failed: %s", exc)
+        sys.exit(1)
+    logging.info("Discovered %s inference case(s).", len(test_cases))
 
     norm_map = {
             "instance": Norm.INSTANCE,  # pyright: ignore[reportUnknownMemberType]
@@ -168,8 +260,6 @@ def main() -> None:
             AsDiscreted(keys="pred", argmax=True),
             SqueezeTransform(keys=["pred"])]
 
-    test_files = [{"image": image} for image in image_paths]
-
     post_transforms_list.extend([
         RemapLabels(keys=["pred"], id_map=inv_id_map)])
 
@@ -212,12 +302,12 @@ def main() -> None:
             overlap=overlap_inference,
         )
     chunk_size = args.chunk_size
-    for test in test_files:
-        logging.info(f"Processing {test['image']}")
+    for test_case in test_cases:
+        logging.info("Processing %s", ", ".join(str(path) for path in test_case.image_paths))
         t0 = perf_counter()
         try:
             run_inference(
-                image_path=Path(test["image"]),
+                image_path=test_case.image_paths,
                 output_dir=output,
                 pre_transforms=pre_transforms,
                 post_transforms=post_transforms,
@@ -228,10 +318,11 @@ def main() -> None:
                 inferer=inferer,
                 out_channels=out_channels,
                 target_pixdim=pix_dim,
+                labels=model_config.dataset.labels,
             )
-            logging.info(f"Inference of {test} finished in {perf_counter()-t0:.2f}s")
+            logging.info("Inference of %s finished in %.2fs", test_case.output_path, perf_counter() - t0)
         except Exception as e:
-            logging.exception(f"Error processing {test['image']}: {e}")
+            logging.exception("Error processing %s: %s", test_case.image_paths, e)
             continue
 # %%
     logging.info("-" * 60)
