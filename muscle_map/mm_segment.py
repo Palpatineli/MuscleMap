@@ -27,7 +27,6 @@ from muscle_map.mm_util import (
     ModelConfig,
     RemapLabels,
     SqueezeTransform,
-    color_table_path,
     get_model_and_config_paths,
     is_nifti,
     prediction_path,
@@ -128,8 +127,9 @@ def _build_inference_cases(
         if output_path in outputs:
             raise ValueError(f"Multiple cases would write '{output_path}'.")
         outputs.add(output_path)
-        if not overwrite and (output_path.exists() or color_table_path(output_path).exists()):
-            raise FileExistsError(f"Output already exists: '{output_path}'. Use --overwrite to replace it.")
+        if not overwrite and output_path.exists():
+            logging.warning("Skipping '%s': output already exists at '%s'.", image_paths[0], output_path)
+            continue
         cases.append(InferenceCase(image_paths=image_paths, output_path=output_path))
     return cases
 
@@ -282,8 +282,8 @@ def main() -> None:
     model = model.to(device)
     model.eval()
     if device.type == "cuda":
-        # GPU inference follows the same compiled execution policy as training.
-        model = cast(torch.nn.Module, torch.compile(model, dynamic=False))  # pyright: ignore[reportUnknownMemberType]
+        # Dynamic shapes are only needed when one compiled model serves multiple cases.
+        model = cast(torch.nn.Module, torch.compile(model, dynamic=len(test_cases) > 1))  # pyright: ignore[reportUnknownMemberType]
 
     overlap_inference = args.overlap / 100
     if spatial_dims == 2:
