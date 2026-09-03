@@ -9,6 +9,7 @@ epoch sees new training examples.
 import argparse
 import json
 import logging
+import math
 import random
 import sys
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -23,6 +24,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal, cast, override
 
+import blosc2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -35,15 +37,10 @@ from monai.metrics.metric import CumulativeIterationMetric
 from monai.networks.nets.unet import UNet
 from monai.transforms import MapTransform
 from monai.transforms.compose import Compose
-from monai.transforms.croppad.dictionary import (
-    CenterSpatialCropd,
-    CropForegroundd,
-    RandCropByPosNegLabeld,
-    SpatialPadd,
-)
+from monai.transforms.croppad.dictionary import CropForegroundd, SpatialPadd
 from monai.transforms.intensity.dictionary import NormalizeIntensityd
 from monai.transforms.io.dictionary import LoadImaged
-from monai.transforms.spatial.dictionary import Orientationd, RandRotated, Spacingd
+from monai.transforms.spatial.dictionary import Orientationd, Spacingd
 from monai.transforms.utility.dictionary import EnsureChannelFirstd, EnsureTyped
 from monai.transforms.utils import map_binary_to_indices
 from monai.utils import set_determinism
@@ -61,7 +58,11 @@ CACHE_ESTIMATE_SAMPLES = 5
 CACHE_SCHEMA_VERSION = 1
 CACHE_FILE_SUFFIX = ".npz.zst"
 CACHE_INDICES_SUFFIX = ".indices.npz"
+CACHE_IMAGE_SUFFIX = ".image.b2nd"
+CACHE_LABEL_SUFFIX = ".label.b2nd"
+CACHE_CHUNKED_METADATA_SUFFIX = ".b2nd.json"
 CACHE_COMPRESSION_LEVEL = 1
+BLOSC_COMPRESSION_LEVEL = 1
 MAX_CACHED_INDICES_PER_CLASS = 20_000
 """Maximum foreground and background candidates stored per case."""
 
@@ -74,6 +75,8 @@ ArrayProducer = Callable[["Sample"], tuple[np.ndarray, np.ndarray]]
 SignatureProducer = Callable[["Sample"], dict[str, Any]]
 UpperEstimate = Callable[["Sample"], int]
 _worker_threadpool_limiter: Any = None
+_blosc_open: Any = blosc2.open
+_blosc_asarray: Any = blosc2.asarray
 
 
 class RemapLabelValuesd(MapTransform):
@@ -111,29 +114,6 @@ class SqueezeLastSpatialDimd(MapTransform):
             if getattr(value, "ndim", 0) >= 4 and value.shape[-1] == 1:
                 result[key] = value.squeeze(-1)
         return result
-
-
-class FixedRandRotated(MapTransform):
-    """Apply the same patch-sized random rotation to every sample from a case."""
-
-    def __init__(self, keys: Sequence[Hashable], radians: float):
-        super().__init__(keys)
-        self.rotation: RandRotated = RandRotated(
-            keys=keys,
-            range_x=radians,
-            range_y=radians,
-            range_z=radians,
-            prob=1.0,
-            mode=("bilinear", "nearest"),
-            padding_mode="border",
-        )
-
-    @override
-    def __call__(self, data: Mapping[Hashable, Any]) -> dict[Hashable, Any]:
-        result = dict(data)
-        seed = int(result.pop("rotation_seed"))
-        self.rotation.set_random_state(seed=seed)
-        return cast(dict[Hashable, Any], self.rotation(result))
 
 
 @dataclass
@@ -196,6 +176,20 @@ class PreparedCacheEntry:
     payload: bytes
     indices_payload: bytes
     array_bytes: int
+
+
+@dataclass
+class PreparedChunkedEntry:
+    """Temporary Blosc2 files ready to replace one legacy cache archive."""
+
+    sample: Sample
+    image_temp: Path
+    label_temp: Path
+    image_shape: tuple[int, ...]
+    label_shape: tuple[int, ...]
+    image_dtype: str
+    label_dtype: str
+    stored_bytes: int
 
 
 @dataclass(frozen=True)
@@ -365,42 +359,14 @@ def _make_preprocess_transforms(config: ModelConfig, original_to_compact: Mappin
     ])
 
 
-def _make_training_transforms(config: ModelConfig, rotation_mode: RotationMode) -> Compose:
-    """Create per-epoch stochastic augmentation and patch sampling transforms."""
-    patch_size = tuple(config.image.train_patch_size)
+def _make_training_transforms(config: ModelConfig) -> Compose:
+    """Pad sampled patches before batched GPU augmentation."""
     radians = float(np.deg2rad(config.training.rotation_degrees))
-    crop_size = _rotation_crop_size(patch_size, radians) if radians > 0 else patch_size
+    crop_size = _rotation_crop_size(config.image.train_patch_size, radians)
     transforms: list[Any] = [
-        EnsureTyped(keys=["image", "label"]),
-        RandCropByPosNegLabeld(
-            keys=["image", "label"],
-            label_key="label",
-            spatial_size=crop_size,
-            pos=1,
-            neg=1,
-            num_samples=config.training.samples_per_volume,
-            image_key="image",
-            image_threshold=0,
-            fg_indices_key="fg_indices",
-            bg_indices_key="bg_indices",
-            allow_smaller=True,
-        ),
         SpatialPadd(keys=["image", "label"], spatial_size=crop_size, method="symmetric", mode="constant"),
+        EnsureTyped(keys=["image", "label"]),
     ]
-    if radians > 0:
-        if rotation_mode == "fixed":
-            transforms.append(FixedRandRotated(keys=["image", "label"], radians=radians))
-        else:
-            transforms.append(RandRotated(
-                keys=["image", "label"],
-                range_x=radians,
-                range_y=radians,
-                range_z=radians,
-                prob=1.0,
-                mode=("bilinear", "nearest"),
-                padding_mode="border",
-            ))
-        transforms.append(CenterSpatialCropd(keys=["image", "label"], roi_size=patch_size))
     if config.architecture.spatial_dims == 2:
         transforms.append(SqueezeLastSpatialDimd(keys=["image", "label"]))
     return Compose(transforms)
@@ -408,8 +374,16 @@ def _make_training_transforms(config: ModelConfig, rotation_mode: RotationMode) 
 
 def _rotation_crop_size(patch_size: Sequence[int], radians: float) -> tuple[int, ...]:
     """Return a conservative crop enclosing a patch rotated around all three axes."""
+    if radians <= 0:
+        return tuple(int(value) for value in patch_size)
     if len(patch_size) != 3:
         return tuple(int(value) for value in patch_size)
+    if patch_size[-1] == 1:
+        cosine = abs(float(np.cos(radians)))
+        sine = abs(float(np.sin(radians)))
+        first = int(np.ceil(cosine * patch_size[0] + sine * patch_size[1])) + 2
+        second = int(np.ceil(sine * patch_size[0] + cosine * patch_size[1])) + 2
+        return (first, second, 1)
     cosine = abs(float(np.cos(radians)))
     sine = abs(float(np.sin(radians)))
     rotate_x = np.asarray(((1, 0, 0), (0, cosine, sine), (0, sine, cosine)))
@@ -495,6 +469,20 @@ class CaseCache:
     def indices_path(self, sample: Sample) -> Path:
         return self.root / f"{sample.case_id}{CACHE_INDICES_SUFFIX}"
 
+    def image_path(self, sample: Sample) -> Path:
+        return self.root / f"{sample.case_id}{CACHE_IMAGE_SUFFIX}"
+
+    def label_path(self, sample: Sample) -> Path:
+        return self.root / f"{sample.case_id}{CACHE_LABEL_SUFFIX}"
+
+    def chunked_metadata_path(self, sample: Sample) -> Path:
+        return self.root / f"{sample.case_id}{CACHE_CHUNKED_METADATA_SUFFIX}"
+
+    def has_chunked_entry(self, sample: Sample) -> bool:
+        return all(path.is_file() for path in (
+            self.image_path(sample), self.label_path(sample), self.chunked_metadata_path(sample),
+        ))
+
     def _read_metadata(self, sample: Sample) -> dict[str, Any] | None:
         path = self.metadata_path(sample)
         if not path.exists():
@@ -507,7 +495,7 @@ class CaseCache:
 
     def is_current(self, sample: Sample) -> bool:
         """Return whether a case cache file matches its current source files."""
-        if not self.data_path(sample).is_file():
+        if not self.data_path(sample).is_file() and not self.has_chunked_entry(sample):
             return False
         metadata = self._read_metadata(sample)
         return metadata is not None and metadata.get("source") == self.source_signature(sample)
@@ -560,7 +548,7 @@ class CaseCache:
             return self._quota_size
         if not self.quota_root.exists():
             return 0
-        suffixes = (CACHE_FILE_SUFFIX, CACHE_INDICES_SUFFIX)
+        suffixes = (CACHE_FILE_SUFFIX, CACHE_INDICES_SUFFIX, CACHE_IMAGE_SUFFIX, CACHE_LABEL_SUFFIX)
         self._quota_size = sum(
             path.stat().st_size for suffix in suffixes
             for path in self.quota_root.rglob(f"*{suffix}") if path.is_file()
@@ -568,14 +556,15 @@ class CaseCache:
         return self._quota_size
 
     def old_entry_size(self, sample: Sample) -> int:
-        path = self.data_path(sample)
-        return path.stat().st_size if path.exists() else 0
+        paths = (self.data_path(sample), self.image_path(sample), self.label_path(sample))
+        return sum(path.stat().st_size for path in paths if path.exists())
 
     def write(self, entry: PreparedCacheEntry, max_bytes: int) -> None:
         """Atomically write one entry while enforcing the global cache quota."""
         old_indices_size = self.indices_path(entry.sample).stat().st_size if self.indices_path(entry.sample).exists() else 0
+        old_entry_size = self.old_entry_size(entry.sample)
         projected_size = (
-            self.quota_bytes() - self.old_entry_size(entry.sample) - old_indices_size
+            self.quota_bytes() - old_entry_size - old_indices_size
             + len(entry.payload) + len(entry.indices_payload)
         )
         if projected_size > max_bytes:
@@ -588,6 +577,12 @@ class CaseCache:
             stream.write(entry.payload)
         temp_path.replace(data_path)
         self._write_indices(entry.sample, entry.indices_payload)
+        for path in (
+            self.image_path(entry.sample),
+            self.label_path(entry.sample),
+            self.chunked_metadata_path(entry.sample),
+        ):
+            path.unlink(missing_ok=True)
         self._quota_size = projected_size
         _write_json(self.metadata_path(entry.sample), {
             "case_id": entry.sample.case_id,
@@ -605,9 +600,7 @@ class CaseCache:
         temp_path.replace(path)
 
     def indices_are_current(self, sample: Sample) -> bool:
-        indices_path = self.indices_path(sample)
-        data_path = self.data_path(sample)
-        return indices_path.is_file() and indices_path.stat().st_mtime_ns >= data_path.stat().st_mtime_ns
+        return self.indices_path(sample).is_file()
 
     def prepare_indices(self, sample: Sample) -> bytes:
         data = self.read(sample)
@@ -623,6 +616,9 @@ class CaseCache:
 
     def read(self, sample: Sample) -> dict[str, np.ndarray]:
         """Load one cached image/label pair as independent contiguous arrays."""
+        if self.has_chunked_entry(sample):
+            image, label = self.open_chunked(sample)
+            return {"image": np.asarray(image[:]), "label": np.asarray(label[:])}
         path = self.data_path(sample)
         if not path.is_file():
             raise RuntimeError(f"Cache entry is missing for case '{sample.case_id}': {path}")
@@ -633,6 +629,15 @@ class CaseCache:
             label = np.ascontiguousarray(arrays["label"])
         return {"image": image, "label": label}
 
+    def open_chunked(self, sample: Sample) -> tuple[Any, Any]:
+        if not self.has_chunked_entry(sample):
+            raise RuntimeError(f"Chunked cache entry is missing for case '{sample.case_id}'.")
+        dparams = {"nthreads": 1}
+        mmap_kwargs = {} if sys.platform == "win32" else {"mmap_mode": "r"}
+        image = _blosc_open(self.image_path(sample), mode="r", dparams=dparams, **mmap_kwargs)
+        label = _blosc_open(self.label_path(sample), mode="r", dparams=dparams, **mmap_kwargs)
+        return image, label
+
     def read_indices(self, sample: Sample) -> dict[str, np.ndarray]:
         with np.load(self.indices_path(sample), allow_pickle=False) as arrays:
             return {
@@ -640,20 +645,182 @@ class CaseCache:
                 "bg_indices": np.asarray(arrays["bg_indices"], dtype=np.int64),
             }
 
+    def array_bytes(self, sample: Sample) -> int:
+        metadata = self._read_metadata(sample)
+        if metadata is None:
+            raise RuntimeError(f"Missing cache metadata for '{sample.case_id}'.")
+        return int(metadata["array_bytes"])
+
+    def activate_chunked(self, entry: PreparedChunkedEntry, max_bytes: int) -> None:
+        """Atomically activate validated Blosc2 arrays, then remove the legacy archive."""
+        old_size = self.old_entry_size(entry.sample)
+        projected_size = self.quota_bytes() - old_size + entry.stored_bytes
+        if projected_size > max_bytes:
+            message = f"Converting '{entry.sample.case_id}' would exceed the cache quota: {_format_bytes(projected_size)} > {_format_bytes(max_bytes)}."
+            raise RuntimeError(message)
+        entry.image_temp.replace(self.image_path(entry.sample))
+        entry.label_temp.replace(self.label_path(entry.sample))
+        _write_json(self.chunked_metadata_path(entry.sample), {
+            "codec": "LZ4",
+            "compression_level": BLOSC_COMPRESSION_LEVEL,
+            "image_dtype": entry.image_dtype,
+            "image_shape": entry.image_shape,
+            "label_dtype": entry.label_dtype,
+            "label_shape": entry.label_shape,
+        })
+        self.data_path(entry.sample).unlink(missing_ok=True)
+        self._quota_size = projected_size
+
+    def discard_redundant_legacy(self, sample: Sample) -> None:
+        path = self.data_path(sample)
+        if self.has_chunked_entry(sample) and path.exists():
+            current_size = self.quota_bytes()
+            size = path.stat().st_size
+            path.unlink()
+            self._quota_size = current_size - size
+
+
+def _blosc_partitions(shape: Sequence[int], patch_size: Sequence[int], itemsize: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Choose nnU-Net-style blocks and chunks sized for per-core CPU caches."""
+    spatial_patch = np.asarray(patch_size, dtype=np.int64)
+    block = np.asarray((shape[0], *(2 ** max(0, math.ceil(math.log2(value))) for value in spatial_patch)))
+    block = np.minimum(block, np.asarray(shape, dtype=np.int64))
+    while int(np.prod(block)) * itemsize > int(32 * 1024 * 0.8):
+        axis = int(np.argmax(block[1:] / np.maximum(spatial_patch, 1))) + 1
+        block[axis] = max(1, block[axis] // 2)
+
+    chunk = block.copy()
+    target_bytes = int(1.375 * 1024 * 1024 * 0.8)
+    while True:
+        candidates = [axis for axis in range(1, len(shape)) if chunk[axis] < shape[axis]]
+        if not candidates:
+            break
+        axis = min(candidates, key=lambda value: chunk[value] / max(spatial_patch[value - 1], 1))
+        candidate = chunk.copy()
+        candidate[axis] = min(shape[axis], candidate[axis] + block[axis])
+        if int(np.prod(candidate)) * itemsize > target_bytes:
+            break
+        chunk = candidate
+    return tuple(int(value) for value in block), tuple(int(value) for value in chunk)
+
+
+def _prepare_chunked_entry(cache: CaseCache, sample: Sample, patch_size: Sequence[int]) -> PreparedChunkedEntry:
+    """Convert one legacy archive into validated temporary Blosc2 arrays."""
+    arrays = cache.read(sample)
+    image = np.ascontiguousarray(arrays["image"], dtype=np.float32)
+    label = np.ascontiguousarray(arrays["label"])
+    image_blocks, image_chunks = _blosc_partitions(image.shape, patch_size, image.dtype.itemsize)
+    label_blocks, label_chunks = _blosc_partitions(label.shape, patch_size, label.dtype.itemsize)
+    image_temp = cache.image_path(sample).with_name(f".{cache.image_path(sample).name}.tmp")
+    label_temp = cache.label_path(sample).with_name(f".{cache.label_path(sample).name}.tmp")
+    image_temp.unlink(missing_ok=True)
+    label_temp.unlink(missing_ok=True)
+    cparams = {"codec": blosc2.Codec.LZ4, "clevel": BLOSC_COMPRESSION_LEVEL, "nthreads": 1}
+    try:
+        _blosc_asarray(image, urlpath=image_temp, chunks=image_chunks, blocks=image_blocks, cparams=cparams)
+        _blosc_asarray(label, urlpath=label_temp, chunks=label_chunks, blocks=label_blocks, cparams=cparams)
+        image_check: Any = _blosc_open(image_temp, mode="r", mmap_mode="r", dparams={"nthreads": 1})
+        label_check: Any = _blosc_open(label_temp, mode="r", mmap_mode="r", dparams={"nthreads": 1})
+        if tuple(image_check.shape) != image.shape or np.dtype(image_check.dtype) != image.dtype:
+            raise RuntimeError(f"Blosc2 image validation failed for '{sample.case_id}'.")
+        if tuple(label_check.shape) != label.shape or np.dtype(label_check.dtype) != label.dtype:
+            raise RuntimeError(f"Blosc2 label validation failed for '{sample.case_id}'.")
+    except Exception:
+        image_temp.unlink(missing_ok=True)
+        label_temp.unlink(missing_ok=True)
+        raise
+    return PreparedChunkedEntry(
+        sample=sample,
+        image_temp=image_temp,
+        label_temp=label_temp,
+        image_shape=tuple(image.shape),
+        label_shape=tuple(label.shape),
+        image_dtype=str(image.dtype),
+        label_dtype=str(label.dtype),
+        stored_bytes=image_temp.stat().st_size + label_temp.stat().st_size,
+    )
+
+
+def _ensure_chunked_cache(
+    cache: CaseCache,
+    cases: Sequence[Sample],
+    patch_size: Sequence[int],
+    max_bytes: int,
+    assume_yes: bool,
+) -> None:
+    """Incrementally replace whole-volume archives with random-access Blosc2 arrays."""
+    for sample in cases:
+        cache.discard_redundant_legacy(sample)
+    pending = [sample for sample in cases if not cache.has_chunked_entry(sample)]
+    if not pending:
+        logging.info("All %s cache entries use random-access Blosc2 storage.", len(cases))
+        return
+
+    sample_cases = pending[:min(CACHE_ESTIMATE_SAMPLES, len(pending))]
+    logging.info("Preparing %s representative Blosc2 cache samples.", len(sample_cases))
+    prepared: list[PreparedChunkedEntry] = []
+    try:
+        prepared = [_prepare_chunked_entry(cache, sample, patch_size) for sample in sample_cases]
+        sampled_raw = sum(cache.array_bytes(entry.sample) for entry in prepared)
+        ratio = sum(entry.stored_bytes for entry in prepared) / max(sampled_raw, 1)
+        estimated_new = int(sum(cache.array_bytes(sample) for sample in pending) * ratio)
+        legacy_bytes = sum(cache.data_path(sample).stat().st_size for sample in pending)
+        projected = cache.quota_bytes() - legacy_bytes + estimated_new
+        logging.info(
+            "Blosc2 cache estimate from %s cases: uncompressed=%s, projected=%s, current=%s, quota=%s.",
+            len(prepared),
+            _format_bytes(sum(cache.array_bytes(sample) for sample in cases)),
+            _format_bytes(projected),
+            _format_bytes(cache.quota_bytes()),
+            _format_bytes(max_bytes),
+        )
+        if projected > max_bytes:
+            message = f"The sampled Blosc2 cache estimate {_format_bytes(projected)} exceeds the quota of {_format_bytes(max_bytes)}."
+            raise RuntimeError(message)
+        if not assume_yes:
+            if not sys.stdin.isatty():
+                raise RuntimeError("Blosc2 cache conversion needs confirmation. Re-run with --yes.")
+            if input("Convert legacy cache entries to Blosc2? [y/N] ").strip().lower() not in {"y", "yes"}:
+                raise RuntimeError("Blosc2 cache conversion cancelled by user.")
+
+        prepared_by_case = {entry.sample.case_id: entry for entry in prepared}
+        for sample in tqdm(pending, desc="Converting cache to Blosc2"):
+            entry = prepared_by_case.pop(sample.case_id, None)
+            if entry is None:
+                entry = _prepare_chunked_entry(cache, sample, patch_size)
+            cache.activate_chunked(entry, max_bytes)
+        _write_json(cache.root / "storage.json", {
+            "blocks": "L1-sized",
+            "chunks": "L3-sized",
+            "codec": "LZ4",
+            "compression_level": BLOSC_COMPRESSION_LEVEL,
+            "format": "Blosc2 NDArray",
+        })
+    finally:
+        for entry in prepared:
+            entry.image_temp.unlink(missing_ok=True)
+            entry.label_temp.unlink(missing_ok=True)
+
 class CachedTrainingDataset(torch.utils.data.Dataset[dict[str, Any]]):
-    """Read cached base volumes and apply stochastic training transforms on demand."""
+    """Read random patches from chunked volumes and prepare GPU augmentation metadata."""
 
     def __init__(
         self,
         cache: CaseCache,
         cases: Sequence[Sample],
         transform: Compose,
+        config: ModelConfig,
         fixed_rotation_seed: int | None = None,
     ) -> None:
         self.cache: CaseCache = cache
         self.cases: list[Sample] = list(cases)
         self.transform: Compose = transform
         self.fixed_rotation_seed: int | None = fixed_rotation_seed
+        self.samples_per_volume: int = config.training.samples_per_volume
+        self.rotation_radians: float = float(np.deg2rad(config.training.rotation_degrees))
+        self.crop_size: tuple[int, ...] = _rotation_crop_size(
+            config.image.train_patch_size, self.rotation_radians,
+        )
 
     def __len__(self) -> int:
         return len(self.cases)
@@ -662,19 +829,60 @@ class CachedTrainingDataset(torch.utils.data.Dataset[dict[str, Any]]):
     def __getitem__(self, index: int) -> Any:
         started = perf_counter()
         sample = self.cases[index]
-        data: dict[str, Any] = self.cache.read(sample)
-        data.update(self.cache.read_indices(sample))
+        indices = self.cache.read_indices(sample)
+        image, label = self.cache.open_chunked(sample)
+        spatial_shape = tuple(int(value) for value in label.shape[1:])
+        fixed_angles: np.ndarray | None = None
         if self.fixed_rotation_seed is not None:
-            data["rotation_seed"] = _fixed_rotation_seed(self.fixed_rotation_seed, sample.case_id)
-        read_seconds = perf_counter() - started
-        transform_started = perf_counter()
-        transformed = self.transform(data)
-        transform_seconds = perf_counter() - transform_started
-        items = cast(list[dict[str, Any]], transformed if isinstance(transformed, list) else [transformed])
+            rng = np.random.default_rng(_fixed_rotation_seed(self.fixed_rotation_seed, sample.case_id))
+            fixed_angles = rng.uniform(-self.rotation_radians, self.rotation_radians, size=3).astype(np.float32)
+
+        items: list[dict[str, Any]] = []
+        transform_seconds = 0.0
+        for _ in range(self.samples_per_volume):
+            fg_indices = indices["fg_indices"]
+            bg_indices = indices["bg_indices"]
+            use_foreground = bool(fg_indices.size and (not bg_indices.size or np.random.random() < 0.5))
+            candidates = fg_indices if use_foreground else bg_indices
+            if not candidates.size:
+                candidates = fg_indices
+            if not candidates.size:
+                raise RuntimeError(f"No valid sampling locations in cache entry '{sample.case_id}'.")
+            flat_index = int(candidates[np.random.randint(candidates.size)])
+            center = tuple(int(value) for value in np.unravel_index(flat_index, spatial_shape))
+            slices = _centered_slices(center, spatial_shape, self.crop_size)
+            patch = {
+                "image": np.ascontiguousarray(image[(slice(None), *slices)]),
+                "label": np.ascontiguousarray(label[(slice(None), *slices)]),
+            }
+            transform_started = perf_counter()
+            transformed = cast(dict[str, Any], self.transform(patch))
+            transform_seconds += perf_counter() - transform_started
+            if fixed_angles is not None:
+                angles = fixed_angles
+            else:
+                angles = np.random.uniform(-self.rotation_radians, self.rotation_radians, size=3).astype(np.float32)
+            transformed["rotation_angles"] = angles
+            items.append(transformed)
+        read_seconds = perf_counter() - started - transform_seconds
         timing = np.asarray((read_seconds / len(items), transform_seconds / len(items)), dtype=np.float64)
         for item in items:
             item["pipeline_timing"] = timing
-        return transformed
+        return items
+
+
+def _centered_slices(
+    center: Sequence[int],
+    spatial_shape: Sequence[int],
+    crop_size: Sequence[int],
+) -> tuple[slice, ...]:
+    """Return a maximal in-bounds crop centered on one sampled voxel."""
+    result: list[slice] = []
+    for location, dimension, requested in zip(center, spatial_shape, crop_size, strict=True):
+        size = min(int(requested), int(dimension))
+        start = min(max(int(location) - size // 2, 0), int(dimension) - size)
+        result.append(slice(start, start + size))
+    return tuple(result)
 
 
 def _format_bytes(num_bytes: int | float) -> str:
@@ -882,6 +1090,7 @@ def _initialize_worker(worker_id: int) -> None:
     global _worker_threadpool_limiter
     monai_worker_init_fn(worker_id)
     torch.set_num_threads(1)
+    blosc2.set_nthreads(1)
     _worker_threadpool_limiter = threadpool_limits(limits=1)
 
 
@@ -900,6 +1109,66 @@ def _autocast_context(amp_mode: AmpMode):
 def _plain_tensor(value: torch.Tensor) -> torch.Tensor:
     """Remove MONAI metadata before a tensor enters a compiled model."""
     return value.as_tensor() if isinstance(value, MetaTensor) else value
+
+
+def _prepare_gpu_batch(
+    batch: dict[str, Any],
+    device: torch.device,
+    config: ModelConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transfer a batch, apply one shared affine per image/label pair, and center-crop it."""
+    images = _plain_tensor(batch["image"]).to(device, dtype=torch.float32, non_blocking=True)
+    labels = _plain_tensor(batch["label"]).to(device, dtype=torch.float32, non_blocking=True)
+    if config.training.rotation_degrees > 0:
+        angles = _plain_tensor(batch["rotation_angles"]).to(device, dtype=torch.float32, non_blocking=True)
+        images, labels = _rotate_gpu(images, labels, angles, config.architecture.spatial_dims)
+    patch_size = tuple(int(value) for value in config.image.train_patch_size)
+    if config.architecture.spatial_dims == 2 and patch_size[-1] == 1:
+        patch_size = patch_size[:-1]
+    slices = tuple(
+        slice((dimension - requested) // 2, (dimension - requested) // 2 + requested)
+        for dimension, requested in zip(images.shape[-len(patch_size):], patch_size, strict=True)
+    )
+    return images[(..., *slices)], labels[(..., *slices)].long()
+
+
+def _rotate_gpu(
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    angles: torch.Tensor,
+    spatial_dims: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate image and label batches with native PyTorch interpolation."""
+    if spatial_dims == 2:
+        angle = angles[:, 2]
+        cosine, sine = torch.cos(angle), torch.sin(angle)
+        zeros = torch.zeros_like(cosine)
+        rotation = torch.stack((cosine, -sine, sine, cosine), dim=1).reshape(-1, 2, 2)
+        scale = torch.as_tensor((images.shape[-1], images.shape[-2]), device=images.device)
+        rotation = rotation * scale[None, None, :] / scale[None, :, None]
+        theta = torch.cat((rotation, zeros[:, None, None].expand(-1, 2, 1)), dim=2)
+    else:
+        x, y, z = angles.unbind(dim=1)
+        cx, cy, cz = torch.cos(x), torch.cos(y), torch.cos(z)
+        sx, sy, sz = torch.sin(x), torch.sin(y), torch.sin(z)
+        rotation = torch.stack((
+            cy * cz,
+            sx * sy * cz - cx * sz,
+            cx * sy * cz + sx * sz,
+            cy * sz,
+            sx * sy * sz + cx * cz,
+            cx * sy * sz - sx * cz,
+            -sy,
+            sx * cy,
+            cx * cy,
+        ), dim=1).reshape(-1, 3, 3)
+        scale = torch.as_tensor((images.shape[-1], images.shape[-2], images.shape[-3]), device=images.device)
+        rotation = rotation * scale[None, None, :] / scale[None, :, None]
+        theta = torch.cat((rotation, torch.zeros((rotation.shape[0], 3, 1), device=rotation.device)), dim=2)
+    grid = F.affine_grid(theta, list(images.shape), align_corners=False)
+    rotated_images = F.grid_sample(images, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    rotated_labels = F.grid_sample(labels, grid, mode="nearest", padding_mode="border", align_corners=False)
+    return rotated_images, rotated_labels
 
 
 def _calibration_step(
@@ -929,8 +1198,7 @@ def _calibration_step(
         model = cast(torch.nn.Module, torch.compile(eager_model, dynamic=False))  # pyright: ignore[reportUnknownMemberType]
         scaler = torch.amp.GradScaler("cuda", enabled=amp_mode == "fp16")
         loss_fn = DiceCELoss(to_onehot_y=True, softmax=True)
-        images = _plain_tensor(batch["image"]).to(device, non_blocking=True)
-        labels = _plain_tensor(batch["label"]).to(device, non_blocking=True).long()
+        images, labels = _prepare_gpu_batch(batch, device, config)
         torch.cuda.reset_peak_memory_stats(device)
         optimizer.zero_grad(set_to_none=True)
         with _autocast_context(amp_mode):
@@ -1106,14 +1374,14 @@ def _run_validation(
     loss_fn: torch.nn.Module,
     dice_metric: CumulativeIterationMetric,
     amp_mode: AmpMode,
+    config: ModelConfig,
 ) -> tuple[float, float]:
     """Evaluate the final model against sampled training patches for a smoke metric."""
     model.eval()
     validation_loss = 0.0
     with torch.inference_mode():
         for batch in loader:
-            images = _plain_tensor(batch["image"]).to(device, non_blocking=True)
-            labels = _plain_tensor(batch["label"]).to(device, non_blocking=True).long()
+            images, labels = _prepare_gpu_batch(batch, device, config)
             with _autocast_context(amp_mode):
                 logits = model(images)
                 validation_loss += loss_fn(logits, labels).item()
@@ -1183,6 +1451,9 @@ def _run_training(args: ArgTrain) -> None:
     base_cache = _build_base_cache(Path(args.dataset_dir).resolve(), cache_dir, config, original_to_compact)
     _ensure_case_cache(base_cache, cases, quota_bytes, args.yes)
     _ensure_sampling_indices(base_cache, cases, quota_bytes)
+    rotation_radians = float(np.deg2rad(config.training.rotation_degrees))
+    cache_patch_size = _rotation_crop_size(config.image.train_patch_size, rotation_radians)
+    _ensure_chunked_cache(base_cache, cases, cache_patch_size, quota_bytes, args.yes)
     _write_training_namespace(cache_dir, base_cache.fingerprint, args.rotation_mode, seed)
 
     active_cache = base_cache
@@ -1190,7 +1461,8 @@ def _run_training(args: ArgTrain) -> None:
     train_dataset = CachedTrainingDataset(
         active_cache,
         cases,
-        _make_training_transforms(config, args.rotation_mode),
+        _make_training_transforms(config),
+        config,
         fixed_rotation_seed=fixed_seed,
     )
     out_channels = len(labels) + 1
@@ -1251,8 +1523,7 @@ def _run_training(args: ArgTrain) -> None:
             pipeline_timing = _plain_tensor(batch.pop("pipeline_timing"))
             cache_read_cpu_seconds += float(pipeline_timing[:, 0].sum())
             transform_cpu_seconds += float(pipeline_timing[:, 1].sum())
-            images = _plain_tensor(batch["image"]).to(device, non_blocking=True)
-            labels_tensor = _plain_tensor(batch["label"]).to(device, non_blocking=True).long()
+            images, labels_tensor = _prepare_gpu_batch(batch, device, config)
             optimizer.zero_grad(set_to_none=True)
             with _autocast_context(args.amp):
                 logits = model(images)
@@ -1309,7 +1580,7 @@ def _run_training(args: ArgTrain) -> None:
     logging.info("Training complete. Final checkpoint: %s", final_path)
 
     dice_metric = DiceMetric(include_background=False, reduction="mean")
-    mean_loss, mean_dice = _run_validation(model, train_loader, device, loss_fn, dice_metric, args.amp)
+    mean_loss, mean_dice = _run_validation(model, train_loader, device, loss_fn, dice_metric, args.amp, config)
     logging.info("Training loss: %.5f. Pseudo dice: %.5f", mean_loss, mean_dice)
 
 

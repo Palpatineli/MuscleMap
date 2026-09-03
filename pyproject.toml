@@ -18,6 +18,7 @@ authors = [
   { name = "Steffen Bollmann" }
 ]
 dependencies = [
+  "blosc2>=3.11",
   "customtkinter>=5.2",
   "mashumaro >= 3.22",
   "matplotlib>=3.9",
