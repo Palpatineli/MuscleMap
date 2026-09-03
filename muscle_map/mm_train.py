@@ -7,7 +7,11 @@ epoch sees new training examples.
 """
 
 import argparse
-from collections.abc import Callable, Mapping, Sequence
+import json
+import logging
+import random
+import sys
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from gzip import BadGzipFile
@@ -15,36 +19,40 @@ from gzip import open as gzip_open
 from hashlib import sha256
 from importlib.resources import files as import_files
 from io import BytesIO
-import json
-import logging
 from pathlib import Path
-import random
-import sys
-from typing import Any, Hashable, Literal, cast, override
+from time import perf_counter
+from typing import Any, Literal, cast, override
 
+import numpy as np
+import torch
+import torch.nn.functional as F
+import zstandard as zstd
 from monai.data import DataLoader, MetaTensor, list_data_collate
+from monai.data import worker_init_fn as monai_worker_init_fn
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
 from monai.metrics.metric import CumulativeIterationMetric
 from monai.networks.nets.unet import UNet
 from monai.transforms import MapTransform
 from monai.transforms.compose import Compose
-from monai.transforms.croppad.dictionary import CropForegroundd, RandCropByPosNegLabeld, SpatialPadd
+from monai.transforms.croppad.dictionary import (
+    CenterSpatialCropd,
+    CropForegroundd,
+    RandCropByPosNegLabeld,
+    SpatialPadd,
+)
 from monai.transforms.intensity.dictionary import NormalizeIntensityd
 from monai.transforms.io.dictionary import LoadImaged
 from monai.transforms.spatial.dictionary import Orientationd, RandRotated, Spacingd
 from monai.transforms.utility.dictionary import EnsureChannelFirstd, EnsureTyped
+from monai.transforms.utils import map_binary_to_indices
 from monai.utils import set_determinism
 from nibabel import Nifti1Header, load
 from nibabel.filebasedimages import ImageFileError
-import numpy as np
-import torch
-import torch.nn.functional as F
+from threadpoolctl import threadpool_limits
 from tqdm import tqdm
-import zstandard as zstd
 
 from muscle_map.mm_util import DatasetParameter, DatasetStats, ModelConfig
-
 
 DATA_STATS_FILE = "data_stats.json"
 CACHE_ESTIMATE_SAMPLES = 5
@@ -52,7 +60,11 @@ CACHE_ESTIMATE_SAMPLES = 5
 
 CACHE_SCHEMA_VERSION = 1
 CACHE_FILE_SUFFIX = ".npz.zst"
+CACHE_INDICES_SUFFIX = ".indices.npz"
 CACHE_COMPRESSION_LEVEL = 1
+MAX_CACHED_INDICES_PER_CLASS = 20_000
+"""Maximum foreground and background candidates stored per case."""
+
 DEFAULT_CACHE_MAX_GB = 10.0
 TRAINING_STATE_FILE = "last_training_state.pt"
 
@@ -61,6 +73,7 @@ RotationMode = Literal["random", "fixed"]
 ArrayProducer = Callable[["Sample"], tuple[np.ndarray, np.ndarray]]
 SignatureProducer = Callable[["Sample"], dict[str, Any]]
 UpperEstimate = Callable[["Sample"], int]
+_worker_threadpool_limiter: Any = None
 
 
 class RemapLabelValuesd(MapTransform):
@@ -98,6 +111,29 @@ class SqueezeLastSpatialDimd(MapTransform):
             if getattr(value, "ndim", 0) >= 4 and value.shape[-1] == 1:
                 result[key] = value.squeeze(-1)
         return result
+
+
+class FixedRandRotated(MapTransform):
+    """Apply the same patch-sized random rotation to every sample from a case."""
+
+    def __init__(self, keys: Sequence[Hashable], radians: float):
+        super().__init__(keys)
+        self.rotation: RandRotated = RandRotated(
+            keys=keys,
+            range_x=radians,
+            range_y=radians,
+            range_z=radians,
+            prob=1.0,
+            mode=("bilinear", "nearest"),
+            padding_mode="border",
+        )
+
+    @override
+    def __call__(self, data: Mapping[Hashable, Any]) -> dict[Hashable, Any]:
+        result = dict(data)
+        seed = int(result.pop("rotation_seed"))
+        self.rotation.set_random_state(seed=seed)
+        return cast(dict[Hashable, Any], self.rotation(result))
 
 
 @dataclass
@@ -158,6 +194,7 @@ class PreparedCacheEntry:
     sample: Sample
     source: dict[str, Any]
     payload: bytes
+    indices_payload: bytes
     array_bytes: int
 
 
@@ -215,7 +252,7 @@ def get_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--auto-batch-for-vram", default=None, type=float, metavar="GB",
                               help="Calibrate a fixed batch size within this decimal-GB VRAM target.")
     train_parser.add_argument("--rotation-mode", default="random", choices=("random", "fixed"),
-                              help="Use fresh random rotations, or cache deterministic per-case rotations.")
+                              help="Use fresh random rotations, or deterministic per-case patch rotations.")
     return parser
 
 
@@ -330,11 +367,31 @@ def _make_preprocess_transforms(config: ModelConfig, original_to_compact: Mappin
 
 def _make_training_transforms(config: ModelConfig, rotation_mode: RotationMode) -> Compose:
     """Create per-epoch stochastic augmentation and patch sampling transforms."""
-    transforms: list[MapTransform] = []
-    if rotation_mode == "random" and config.training.rotation_degrees > 0:
-        radians = float(np.deg2rad(config.training.rotation_degrees))
-        transforms.append(
-            RandRotated(
+    patch_size = tuple(config.image.train_patch_size)
+    radians = float(np.deg2rad(config.training.rotation_degrees))
+    crop_size = _rotation_crop_size(patch_size, radians) if radians > 0 else patch_size
+    transforms: list[Any] = [
+        EnsureTyped(keys=["image", "label"]),
+        RandCropByPosNegLabeld(
+            keys=["image", "label"],
+            label_key="label",
+            spatial_size=crop_size,
+            pos=1,
+            neg=1,
+            num_samples=config.training.samples_per_volume,
+            image_key="image",
+            image_threshold=0,
+            fg_indices_key="fg_indices",
+            bg_indices_key="bg_indices",
+            allow_smaller=True,
+        ),
+        SpatialPadd(keys=["image", "label"], spatial_size=crop_size, method="symmetric", mode="constant"),
+    ]
+    if radians > 0:
+        if rotation_mode == "fixed":
+            transforms.append(FixedRandRotated(keys=["image", "label"], radians=radians))
+        else:
+            transforms.append(RandRotated(
                 keys=["image", "label"],
                 range_x=radians,
                 range_y=radians,
@@ -342,30 +399,24 @@ def _make_training_transforms(config: ModelConfig, rotation_mode: RotationMode) 
                 prob=1.0,
                 mode=("bilinear", "nearest"),
                 padding_mode="border",
-            )
-        )
-    transforms.extend([
-        SpatialPadd(
-            keys=["image", "label"],
-            spatial_size=config.image.train_patch_size,
-            method="end",
-            mode="constant",
-        ),
-        EnsureTyped(keys=["image", "label"]),
-        RandCropByPosNegLabeld(
-            keys=["image", "label"],
-            label_key="label",
-            spatial_size=config.image.train_patch_size,
-            pos=1,
-            neg=1,
-            num_samples=config.training.samples_per_volume,
-            image_key="image",
-            image_threshold=0,
-        ),
-    ])
+            ))
+        transforms.append(CenterSpatialCropd(keys=["image", "label"], roi_size=patch_size))
     if config.architecture.spatial_dims == 2:
         transforms.append(SqueezeLastSpatialDimd(keys=["image", "label"]))
     return Compose(transforms)
+
+
+def _rotation_crop_size(patch_size: Sequence[int], radians: float) -> tuple[int, ...]:
+    """Return a conservative crop enclosing a patch rotated around all three axes."""
+    if len(patch_size) != 3:
+        return tuple(int(value) for value in patch_size)
+    cosine = abs(float(np.cos(radians)))
+    sine = abs(float(np.sin(radians)))
+    rotate_x = np.asarray(((1, 0, 0), (0, cosine, sine), (0, sine, cosine)))
+    rotate_y = np.asarray(((cosine, 0, sine), (0, 1, 0), (sine, 0, cosine)))
+    rotate_z = np.asarray(((cosine, sine, 0), (sine, cosine, 0), (0, 0, 1)))
+    extent = rotate_z @ rotate_y @ rotate_x @ np.asarray(patch_size, dtype=np.float64)
+    return tuple(int(np.ceil(value)) + 2 for value in extent)
 
 
 def _to_numpy(value: Any) -> np.ndarray:
@@ -421,6 +472,7 @@ class CaseCache:
         self.source_signature: SignatureProducer = source_signature
         self.array_producer: ArrayProducer = array_producer
         self.upper_estimate: UpperEstimate = upper_estimate
+        self._quota_size: int | None = None
         self.root.mkdir(parents=True, exist_ok=True)
         self._write_manifest()
 
@@ -439,6 +491,9 @@ class CaseCache:
 
     def metadata_path(self, sample: Sample) -> Path:
         return self.root / f"{sample.case_id}.json"
+
+    def indices_path(self, sample: Sample) -> Path:
+        return self.root / f"{sample.case_id}{CACHE_INDICES_SUFFIX}"
 
     def _read_metadata(self, sample: Sample) -> dict[str, Any] | None:
         path = self.metadata_path(sample)
@@ -472,6 +527,21 @@ class CaseCache:
         payload = zstd.ZstdCompressor(level=CACHE_COMPRESSION_LEVEL).compress(raw)
         return payload, image_array.nbytes + label_array.nbytes
 
+    def _encode_indices(self, sample: Sample, image: np.ndarray, label: np.ndarray) -> bytes:
+        fg_indices, bg_indices = map_binary_to_indices(label, image, image_threshold=0)
+        rng = np.random.default_rng(_fixed_rotation_seed(0, f"{self.fingerprint}:{sample.case_id}"))
+
+        def bounded(values: Any) -> np.ndarray:
+            array = np.asarray(values, dtype=np.int64)
+            if array.size > MAX_CACHED_INDICES_PER_CLASS:
+                selected = rng.choice(array.size, size=MAX_CACHED_INDICES_PER_CLASS, replace=False)
+                array = array[selected]
+            return np.ascontiguousarray(array)
+
+        stream = BytesIO()
+        np.savez(stream, fg_indices=bounded(fg_indices), bg_indices=bounded(bg_indices))
+        return stream.getvalue()
+
     def prepare(self, sample: Sample) -> PreparedCacheEntry:
         """Run preprocessing for one case without modifying the cache."""
         image, label = self.array_producer(sample)
@@ -480,14 +550,22 @@ class CaseCache:
             sample=sample,
             source=self.source_signature(sample),
             payload=payload,
+            indices_payload=self._encode_indices(sample, image, label),
             array_bytes=array_bytes,
         )
 
     def quota_bytes(self) -> int:
         """Return compressed cache bytes in the configured cache namespace."""
+        if self._quota_size is not None:
+            return self._quota_size
         if not self.quota_root.exists():
             return 0
-        return sum(path.stat().st_size for path in self.quota_root.rglob(f"*{CACHE_FILE_SUFFIX}") if path.is_file())
+        suffixes = (CACHE_FILE_SUFFIX, CACHE_INDICES_SUFFIX)
+        self._quota_size = sum(
+            path.stat().st_size for suffix in suffixes
+            for path in self.quota_root.rglob(f"*{suffix}") if path.is_file()
+        )
+        return self._quota_size
 
     def old_entry_size(self, sample: Sample) -> int:
         path = self.data_path(sample)
@@ -495,7 +573,11 @@ class CaseCache:
 
     def write(self, entry: PreparedCacheEntry, max_bytes: int) -> None:
         """Atomically write one entry while enforcing the global cache quota."""
-        projected_size = self.quota_bytes() - self.old_entry_size(entry.sample) + len(entry.payload)
+        old_indices_size = self.indices_path(entry.sample).stat().st_size if self.indices_path(entry.sample).exists() else 0
+        projected_size = (
+            self.quota_bytes() - self.old_entry_size(entry.sample) - old_indices_size
+            + len(entry.payload) + len(entry.indices_payload)
+        )
         if projected_size > max_bytes:
             message = f"Writing '{entry.sample.case_id}' would exceed the cache quota: {_format_bytes(projected_size)} > {_format_bytes(max_bytes)}."
             raise RuntimeError(message)
@@ -505,6 +587,8 @@ class CaseCache:
         with temp_path.open("wb") as stream:
             stream.write(entry.payload)
         temp_path.replace(data_path)
+        self._write_indices(entry.sample, entry.indices_payload)
+        self._quota_size = projected_size
         _write_json(self.metadata_path(entry.sample), {
             "case_id": entry.sample.case_id,
             "fingerprint": self.fingerprint,
@@ -513,11 +597,35 @@ class CaseCache:
             "array_bytes": entry.array_bytes,
         })
 
+    def _write_indices(self, sample: Sample, payload: bytes) -> None:
+        path = self.indices_path(sample)
+        temp_path = path.with_name(f".{path.name}.tmp")
+        with temp_path.open("wb") as stream:
+            stream.write(payload)
+        temp_path.replace(path)
+
+    def indices_are_current(self, sample: Sample) -> bool:
+        indices_path = self.indices_path(sample)
+        data_path = self.data_path(sample)
+        return indices_path.is_file() and indices_path.stat().st_mtime_ns >= data_path.stat().st_mtime_ns
+
+    def prepare_indices(self, sample: Sample) -> bytes:
+        data = self.read(sample)
+        return self._encode_indices(sample, data["image"], data["label"])
+
+    def write_indices(self, sample: Sample, payload: bytes, max_bytes: int) -> None:
+        old_size = self.indices_path(sample).stat().st_size if self.indices_path(sample).exists() else 0
+        projected_size = self.quota_bytes() - old_size + len(payload)
+        if projected_size > max_bytes:
+            raise RuntimeError(f"Sampling indices for '{sample.case_id}' would exceed the cache quota.")
+        self._write_indices(sample, payload)
+        self._quota_size = projected_size
+
     def read(self, sample: Sample) -> dict[str, np.ndarray]:
         """Load one cached image/label pair as independent contiguous arrays."""
         path = self.data_path(sample)
-        if not self.is_current(sample):
-            raise RuntimeError(f"Cache entry is missing or stale for case '{sample.case_id}': {path}")
+        if not path.is_file():
+            raise RuntimeError(f"Cache entry is missing for case '{sample.case_id}': {path}")
         compressed = path.read_bytes()
         raw = zstd.ZstdDecompressor().decompress(compressed)
         with np.load(BytesIO(raw), allow_pickle=False) as arrays:
@@ -525,27 +633,48 @@ class CaseCache:
             label = np.ascontiguousarray(arrays["label"])
         return {"image": image, "label": label}
 
-    def entry_array_bytes(self, sample: Sample) -> int:
-        metadata = self._read_metadata(sample)
-        if metadata is None:
-            raise RuntimeError(f"Missing cache metadata for '{sample.case_id}'.")
-        return int(metadata["array_bytes"])
-
+    def read_indices(self, sample: Sample) -> dict[str, np.ndarray]:
+        with np.load(self.indices_path(sample), allow_pickle=False) as arrays:
+            return {
+                "fg_indices": np.asarray(arrays["fg_indices"], dtype=np.int64),
+                "bg_indices": np.asarray(arrays["bg_indices"], dtype=np.int64),
+            }
 
 class CachedTrainingDataset(torch.utils.data.Dataset[dict[str, Any]]):
     """Read cached base volumes and apply stochastic training transforms on demand."""
 
-    def __init__(self, cache: CaseCache, cases: Sequence[Sample], transform: Compose) -> None:
+    def __init__(
+        self,
+        cache: CaseCache,
+        cases: Sequence[Sample],
+        transform: Compose,
+        fixed_rotation_seed: int | None = None,
+    ) -> None:
         self.cache: CaseCache = cache
         self.cases: list[Sample] = list(cases)
         self.transform: Compose = transform
+        self.fixed_rotation_seed: int | None = fixed_rotation_seed
 
     def __len__(self) -> int:
         return len(self.cases)
 
     @override
     def __getitem__(self, index: int) -> Any:
-        return self.transform(self.cache.read(self.cases[index]))
+        started = perf_counter()
+        sample = self.cases[index]
+        data: dict[str, Any] = self.cache.read(sample)
+        data.update(self.cache.read_indices(sample))
+        if self.fixed_rotation_seed is not None:
+            data["rotation_seed"] = _fixed_rotation_seed(self.fixed_rotation_seed, sample.case_id)
+        read_seconds = perf_counter() - started
+        transform_started = perf_counter()
+        transformed = self.transform(data)
+        transform_seconds = perf_counter() - transform_started
+        items = cast(list[dict[str, Any]], transformed if isinstance(transformed, list) else [transformed])
+        timing = np.asarray((read_seconds / len(items), transform_seconds / len(items)), dtype=np.float64)
+        for item in items:
+            item["pipeline_timing"] = timing
+        return transformed
 
 
 def _format_bytes(num_bytes: int | float) -> str:
@@ -616,7 +745,7 @@ def _ensure_case_cache(
     logging.info("Preparing %s representative cache-estimate samples.", len(sample_cases))
     prepared_samples = [cache.prepare(sample) for sample in sample_cases]
     sampled_upper = sum(upper_by_case[entry.sample.case_id] for entry in prepared_samples)
-    sampled_compressed = sum(len(entry.payload) for entry in prepared_samples)
+    sampled_compressed = sum(len(entry.payload) + len(entry.indices_payload) for entry in prepared_samples)
     compression_ratio = sampled_compressed / max(sampled_upper, 1)
     remaining_upper = sum(upper_by_case[sample.case_id] for sample in pending[len(sample_cases):])
     conservative = current_bytes - old_pending_bytes + sum(upper_by_case.values())
@@ -636,6 +765,25 @@ def _ensure_case_cache(
         if entry is None:
             entry = cache.prepare(sample)
         cache.write(entry, max_bytes)
+
+
+def _ensure_sampling_indices(
+    cache: CaseCache,
+    cases: Sequence[Sample],
+    max_bytes: int,
+) -> None:
+    """Add bounded sampling-index sidecars without rebuilding volume archives."""
+    pending = [sample for sample in cases if not cache.indices_are_current(sample)]
+    if not pending:
+        logging.info("All %s sampling-index cache entries are current.", len(cases))
+        return
+    logging.info(
+        "Building sampling indices for %s existing cache entries (at most %s candidates per class).",
+        len(pending),
+        MAX_CACHED_INDICES_PER_CLASS,
+    )
+    for sample in tqdm(pending, desc="Caching sampling indices"):
+        cache.write_indices(sample, cache.prepare_indices(sample), max_bytes)
 
 
 def _cache_specification(config: ModelConfig, original_to_compact: Mapping[int, int]) -> dict[str, Any]:
@@ -687,68 +835,16 @@ def _fixed_rotation_seed(seed: int, case_id: str) -> int:
     return int.from_bytes(value[:8], byteorder="little") % (2**32)
 
 
-def _build_fixed_rotation_cache(
-    dataset_dir: Path,
-    cache_dir: Path,
-    base_cache: CaseCache,
-    config: ModelConfig,
-    seed: int,
-) -> CaseCache:
-    """Create a separate cache of deterministic, per-case random rotations."""
-    training_root = cache_dir.parent / "training_cache"
-    radians = float(np.deg2rad(config.training.rotation_degrees))
-
-    def source_signature(sample: Sample) -> dict[str, Any]:
-        base_path = base_cache.data_path(sample)
-        return {"base_cache": _file_signature(base_path), "base_fingerprint": base_cache.fingerprint}
-
-    def produce(sample: Sample) -> tuple[np.ndarray, np.ndarray]:
-        data = base_cache.read(sample)
-        if config.training.rotation_degrees <= 0:
-            return data["image"], data["label"]
-        transform = RandRotated(
-            keys=["image", "label"],
-            range_x=radians,
-            range_y=radians,
-            range_z=radians,
-            prob=1.0,
-            mode=("bilinear", "nearest"),
-            padding_mode="border",
-        )
-        transform.set_random_state(seed=_fixed_rotation_seed(seed, sample.case_id))
-        rotated = transform(cast(Any, data))
-        return _to_numpy(rotated["image"]), _to_numpy(rotated["label"])
-
-    def upper_estimate(sample: Sample) -> int:
-        # keep_size=True means rotation cannot exceed its base cache array size.
-        return int(base_cache.entry_array_bytes(sample) * 1.01) + 1024 * 1024
-
-    specification = {
-        "cache_schema_version": CACHE_SCHEMA_VERSION,
-        "base_fingerprint": base_cache.fingerprint,
-        "rotation_mode": "fixed",
-        "rotation_degrees": config.training.rotation_degrees,
-        "seed": seed,
-    }
-    return CaseCache(
-        root=training_root,
-        quota_root=dataset_dir,
-        specification=specification,
-        source_signature=source_signature,
-        array_producer=produce,
-        upper_estimate=upper_estimate,
-    )
-
-
 def _write_training_namespace(cache_dir: Path, base_fingerprint: str, rotation_mode: RotationMode, seed: int) -> None:
-    """Record the random-mode namespace even though random rotations are not persisted."""
+    """Record the online augmentation namespace for reproducibility."""
     root = cache_dir.parent / "training_cache" / f"{base_fingerprint}-{rotation_mode}"
     root.mkdir(parents=True, exist_ok=True)
     _write_json(root / "manifest.json", {
         "base_fingerprint": base_fingerprint,
         "rotation_mode": rotation_mode,
         "seed": seed,
-        "persisted": rotation_mode == "fixed",
+        "persisted": False,
+        "scope": "patch",
     })
 
 
@@ -776,8 +872,17 @@ def _make_loader(
         pin_memory=True,
         drop_last=len(dataset) >= effective_batch_size,
         generator=generator,
+        worker_init_fn=_initialize_worker,
         **worker_kwargs,
     )
+
+
+def _initialize_worker(worker_id: int) -> None:
+    """Seed MONAI transforms and prevent native CPU libraries from oversubscribing."""
+    global _worker_threadpool_limiter
+    monai_worker_init_fn(worker_id)
+    torch.set_num_threads(1)
+    _worker_threadpool_limiter = threadpool_limits(limits=1)
 
 
 def _create_model(config: ModelConfig, out_channels: int, device: torch.device) -> UNet:
@@ -1059,7 +1164,9 @@ def _run_training(args: ArgTrain) -> None:
     _write_json(result_dir / "training_config.json", config.to_dict())
 
     seed = args.seed if args.seed is not None else config.training.seed
-    set_determinism(seed=seed)
+    set_determinism(seed=seed, use_deterministic_algorithms=False)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
     labels = sorted({value for value in config.dataset.labels.values() if value > 0})
     original_to_compact = {0: 0}
     for compact_id, original_id in enumerate(labels, start=1):
@@ -1075,15 +1182,17 @@ def _run_training(args: ArgTrain) -> None:
     quota_bytes = int(args.cache_max_gb * 1_000_000_000)
     base_cache = _build_base_cache(Path(args.dataset_dir).resolve(), cache_dir, config, original_to_compact)
     _ensure_case_cache(base_cache, cases, quota_bytes, args.yes)
+    _ensure_sampling_indices(base_cache, cases, quota_bytes)
     _write_training_namespace(cache_dir, base_cache.fingerprint, args.rotation_mode, seed)
 
     active_cache = base_cache
-    if args.rotation_mode == "fixed":
-        rotation_cache = _build_fixed_rotation_cache(Path(args.dataset_dir).resolve(), cache_dir, base_cache, config, seed)
-        _ensure_case_cache(rotation_cache, cases, quota_bytes, args.yes)
-        active_cache = rotation_cache
-
-    train_dataset = CachedTrainingDataset(active_cache, cases, _make_training_transforms(config, args.rotation_mode))
+    fixed_seed = seed if args.rotation_mode == "fixed" and config.training.rotation_degrees > 0 else None
+    train_dataset = CachedTrainingDataset(
+        active_cache,
+        cases,
+        _make_training_transforms(config, args.rotation_mode),
+        fixed_rotation_seed=fixed_seed,
+    )
     out_channels = len(labels) + 1
     learning_rate = args.learning_rate if args.learning_rate is not None else float(config.training.learning_rate)
     num_workers = args.num_workers if args.num_workers is not None else config.training.num_workers
@@ -1125,8 +1234,23 @@ def _run_training(args: ArgTrain) -> None:
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-        epoch_loss = 0.0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}"):
+        epoch_started = perf_counter()
+        data_wait_seconds = 0.0
+        cache_read_cpu_seconds = 0.0
+        transform_cpu_seconds = 0.0
+        epoch_loss = torch.zeros((), device=device)
+        iterator = iter(train_loader)
+        progress = tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{args.epochs}")
+        while True:
+            wait_started = perf_counter()
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+            data_wait_seconds += perf_counter() - wait_started
+            pipeline_timing = _plain_tensor(batch.pop("pipeline_timing"))
+            cache_read_cpu_seconds += float(pipeline_timing[:, 0].sum())
+            transform_cpu_seconds += float(pipeline_timing[:, 1].sum())
             images = _plain_tensor(batch["image"]).to(device, non_blocking=True)
             labels_tensor = _plain_tensor(batch["label"]).to(device, non_blocking=True).long()
             optimizer.zero_grad(set_to_none=True)
@@ -1140,10 +1264,21 @@ def _run_training(args: ArgTrain) -> None:
             else:
                 loss.backward()
                 optimizer.step()
-            epoch_loss += loss.item()
+            epoch_loss += loss.detach()
+            progress.update()
+        progress.close()
 
-        epoch_loss /= max(len(train_loader), 1)
-        logging.info("Epoch %s/%s - train_loss=%.5f", epoch, args.epochs, epoch_loss)
+        epoch_loss_value = float(epoch_loss.item()) / max(len(train_loader), 1)
+        logging.info(
+            "Epoch %s/%s - train_loss=%.5f wall=%.1fs data_wait=%.1fs cache_read_cpu=%.1fs transform_cpu=%.1fs",
+            epoch,
+            args.epochs,
+            epoch_loss_value,
+            perf_counter() - epoch_started,
+            data_wait_seconds,
+            cache_read_cpu_seconds,
+            transform_cpu_seconds,
+        )
         if epoch % args.save_every == 0:
             checkpoint = _save_checkpoint(model, config, result_dir / f"checkpoint_epoch_{epoch:04d}")
             _save_training_state(

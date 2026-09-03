@@ -13,3 +13,4 @@ muscle_map/models/*/
 output/
 *.log
 *.xlsx
+training_config.json
