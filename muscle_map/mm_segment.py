@@ -124,6 +124,10 @@ def _build_inference_cases(
             )
         image_paths = tuple(channel_map[channel] for channel in channel_ids)
         output_path = prediction_path(image_paths[0], output_dir)
+        if output_path.resolve() in image_paths:
+            raise ValueError(
+                f"Output '{output_path}' would overwrite an input image; choose a different output directory."
+            )
         if output_path in outputs:
             raise ValueError(f"Multiple cases would write '{output_path}'.")
         outputs.add(output_path)
@@ -149,7 +153,7 @@ def get_parser() -> argparse.ArgumentParser:
     # Optional arguments
     optional = parser.add_argument_group("Optional")
     optional.add_argument("-o", '--output_dir', required=False, type=str,
-                          help="Output directory. Channel-suffixed inputs such as case_0000.nii.gz produce case.nii.gz; other inputs produce *_dseg.nii.gz.")
+                          help="Output directory. Input names are preserved, except trailing channel suffixes such as _0000 are removed.")
 
     optional.add_argument("--overwrite", action="store_true",
                           help="Replace existing segmentation and color-table outputs.")

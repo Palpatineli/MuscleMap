@@ -1245,12 +1245,12 @@ def _nifti_stem(image_path: Path) -> str:
 
 
 def prediction_path(image_path: Path, output_dir: Path) -> Path:
-    """Return the segmentation path, honoring nnU-Net-style channel suffixes."""
+    """Preserve the input name, removing an nnU-Net-style channel suffix."""
     base = _nifti_stem(image_path)
     channel_match = _CHANNEL_SUFFIX.fullmatch(base)
     if channel_match:
-        return output_dir / f"{channel_match.group('case')}.nii.gz"
-    return output_dir / f"{base}_dseg.nii.gz"
+        base = channel_match.group("case")
+    return output_dir / f"{base}.nii.gz"
 
 
 def color_table_path(segmentation_path: Path) -> Path:

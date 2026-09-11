@@ -1,0 +1,15 @@
+{
+  "description": "CHANGE_ME_DATASET_DESCRIPTION",
+  "labels": {
+    "background": 0,
+    "CHANGE_ME_FOREGROUND_LABEL": 1
+  },
+  "name": "CHANGE_ME_DATASET_NAME",
+  "numTraining": 1,
+  "reference": "CHANGE_ME_DATASET_REFERENCE_OR_EMPTY_STRING",
+  "release": "CHANGE_ME_DATASET_VERSION",
+  "channel_names": {
+    "0": "CHANGE_ME_MODALITY_NAME"
+  },
+  "file_ending": ".nii.gz"
+}

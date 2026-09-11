@@ -1,0 +1,18 @@
+{
+  "dataset_dir": "CHANGE_ME_ABSOLUTE_DATASET_PATH",
+  "num_cases": 1,
+  "spacings": [
+    [
+      1.0,
+      1.0,
+      1.0
+    ]
+  ],
+  "sizes": [
+    [
+      128,
+      128,
+      128
+    ]
+  ]
+}
