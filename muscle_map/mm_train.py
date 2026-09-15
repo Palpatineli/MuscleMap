@@ -52,6 +52,7 @@ from tqdm import tqdm
 from muscle_map.mm_util import DatasetParameter, DatasetStats, ModelConfig
 
 DATA_STATS_FILE = "data_stats.json"
+TRAINING_CONFIG_FILE = "training_config.json"
 CACHE_ESTIMATE_SAMPLES = 5
 """Number of cases used for the always-on refined cache-size estimate."""
 
@@ -329,18 +330,23 @@ def _build_config(
     data_parameter: DatasetParameter,
     dataset_stats: DatasetStats,
     spacing_override: tuple[float, float, float] | None,
+    config_file: Path,
 ) -> ModelConfig:
-    """Build a training config with a rounded median or explicit target spacing."""
-    default_config_file = import_files("muscle_map") / "model_config_default.json"
-    config = ModelConfig.load_config(default_config_file, dataset=data_parameter.to_dict())  # pyright: ignore[reportUnknownMemberType]
-    config.architecture.in_channels = len(data_parameter.channel_names)
-    if spacing_override is None:
+    """Load an existing training config or initialize one from package defaults."""
+    if config_file.is_file():
+        logging.info("Loading training config from %s.", config_file)
+        config = ModelConfig.load_config(config_file)  # pyright: ignore[reportUnknownMemberType]
+    else:
+        default_config_file = import_files("muscle_map") / "model_config_default.json"
+        logging.info("Initializing training config from %s.", default_config_file)
+        config = ModelConfig.load_config(default_config_file, dataset=data_parameter.to_dict())  # pyright: ignore[reportUnknownMemberType]
+        config.architecture.in_channels = len(data_parameter.channel_names)
         median_spacing = np.median(np.asarray(dataset_stats.spacings, dtype=np.float64), axis=0)
         config.image.spacing = cast(
             tuple[float, float, float],
             tuple(float(round(value, 1)) for value in median_spacing),
         )
-    else:
+    if spacing_override is not None:
         config.image.spacing = cast(tuple[float, float, float], tuple(float(value) for value in spacing_override))
     return config
 
@@ -1427,9 +1433,10 @@ def _run_training(args: ArgTrain) -> None:
 
     dataset_stats = DatasetStats.load_config(result_dir / DATA_STATS_FILE)  # pyright: ignore[reportUnknownMemberType]
     dataset_parameter = DatasetParameter.load_config(result_dir / "dataset_parameter.json")  # pyright: ignore[reportUnknownMemberType]
-    config = _build_config(dataset_parameter, dataset_stats, args.spacing)
+    config_file = result_dir / TRAINING_CONFIG_FILE
+    config = _build_config(dataset_parameter, dataset_stats, args.spacing, config_file)
     config.require_trainable()
-    _write_json(result_dir / "training_config.json", config.to_dict())
+    _write_json(config_file, config.to_dict())
 
     seed = args.seed if args.seed is not None else config.training.seed
     set_determinism(seed=seed, use_deterministic_algorithms=False)

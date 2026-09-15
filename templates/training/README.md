@@ -1,8 +1,9 @@
 # Training Metadata Templates
 
 `mm_train train` reads `dataset_parameter.json` and `data_stats.json` from the
-directory passed to `--result_dir`. It generates `training_config.json` in that
-directory; do not create that file manually.
+directory passed to `--result_dir`. If `training_config.json` already exists in
+that directory, training uses it. Otherwise, the command initializes it from
+the packaged defaults and the dataset metadata.
 
 ## Recommended setup
 
